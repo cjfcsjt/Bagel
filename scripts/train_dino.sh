@@ -10,17 +10,20 @@ export WANDB_PROJECT="bagel-geo-training"     # 你可以选择一个项目名
 
 export CUDA_VISIBLE_DEVICES=0
 # replace the variables with your own
+# Using DINOv2 instead of SigLIP
 torchrun \
   --nnodes=1 \
   --node_rank=0 \
-  --nproc_per_node=1 \
+  --nproc_per_node=8 \
   --master_addr=localhost \
   --master_port=12345 \
   train/pretrain_unified_navit.py \
   --dataset_config_file ./data/configs/example.yaml \
   --layer_module Qwen2MoTDecoderLayer \
   --vae_path /data/spatial_data/hf/flux/ae.safetensors \
-  --vit_path /data/spatial_data/hf/siglip-so400m-14-980-flash-attn2-navit \
+  --vit_type dino \
+  --vit_path facebook/dinov2-large \
+  --vit_patch_size 14 \
   --llm_path /data/spatial_data/hf/Qwen2.5-0.5B-Instruct \
   --use_flex True \
   --resume_from None \

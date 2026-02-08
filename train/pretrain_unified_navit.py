@@ -31,6 +31,7 @@ from modeling.autoencoder import load_ae
 from modeling.bagel import (
     BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
 )
+from transformers import Dinov2Config, Dinov2Model
 from modeling.qwen2 import Qwen2Tokenizer
 from train.train_utils import create_logger, get_latest_ckpt
 from train.fsdp_utils import (
@@ -123,7 +124,15 @@ class ModelArguments:
     )
     vit_path: str = field(
         default="hf/siglip-so400m-14-980-flash-attn2-navit/",
-        metadata={"help": "Path or repo ID of the SigLIP Vision Transformer used for image understanding."}
+        metadata={"help": "Path or repo ID of the Vision Transformer used for image understanding."}
+    )
+    vit_type: str = field(
+        default="siglip",
+        metadata={"help": "Type of Vision Transformer: 'siglip' or 'dino'."}
+    )
+    dino_path: str = field(
+        default="hf/dinov2-large-with-registers/",
+        metadata={"help": "Path or repo ID of the DINOv2 model used for image reconstruction."}
     )
     max_latent_size: int = field(
         default=32,
@@ -218,6 +227,10 @@ class TrainingArguments:
     visual_und: bool = field(
         default=True,
         metadata={"help": "Train image understanding branch."}
+    )
+    visual_recon: bool = field(
+        default=False,
+        metadata={"help": "Train image reconstruction branch with DINOv2."}
     )
 
     # --- bookkeeping & logging ---
@@ -407,9 +420,11 @@ class TrainingArguments:
 
 def main():
     assert torch.cuda.is_available()
-    dist.init_process_group("nccl")
-    device = dist.get_rank() % torch.cuda.device_count()
+    # dist.init_process_group("nccl")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = local_rank % torch.cuda.device_count()
     torch.cuda.set_device(device)
+    dist.init_process_group("nccl", rank=local_rank, world_size=torch.cuda.device_count())
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     if training_args.peak_device_tflops <= 0:
@@ -470,44 +485,74 @@ def main():
     set_seed(seed)
 
     # Setup model:
+    # 1. 加载语言模型
     if training_args.finetune_from_hf:
-        llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json"))
+        llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json")) # 从本地json文件直接加载配置，因为可能已经包含了Bagel的特有配置
     else:
         llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
-    llm_config.layer_module = model_args.layer_module
-    llm_config.qk_norm = model_args.llm_qk_norm
-    llm_config.tie_word_embeddings = model_args.tie_word_embeddings
-    llm_config.freeze_und = training_args.freeze_und
+    # 添加覆盖特有配置
+    llm_config.layer_module = model_args.layer_module # (arch) 指定使用哪个解码器层类（默认是 "Qwen2MoTDecoderLayer"）, BAGEL 的 MoT（Mixture of Tokens）架构的核心
+    llm_config.qk_norm = model_args.llm_qk_norm # (arch) 是否在注意力机制中启用 QK LayerNorm
+    llm_config.tie_word_embeddings = model_args.tie_word_embeddings # (arch) 是否共享输入和输出的词嵌入矩阵
+    llm_config.freeze_und = training_args.freeze_und # (grad) 是否冻结视觉理解（understanding）分支的连接器
     if training_args.finetune_from_hf:
-        language_model = Qwen2ForCausalLM(llm_config)
+        language_model = Qwen2ForCausalLM(llm_config) # 只用配置初始化模型结构，不加载预训练权重, 权重会在后面通过 FSDPCheckpoint.try_load_ckpt() 从 BAGEL 完整模型中加载, 适用于从 hf/BAGEL-7B-MoT 这样的完整 BAGEL 模型继续训练
     else:
-        language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
+        language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config) # 从 HuggingFace 预训练模型加载权重, 会读取 hf/Qwen2.5-0.5B-Instruct/ 中的 model.safetensors 等权重文件
     if training_args.copy_init_moe:
-        language_model.init_moe()
-
+        language_model.init_moe() # 这个方法会复制初始化 MoE（Mixture of Experts）专家的权重, 确保每个专家在训练开始时有相同的初始化，避免随机初始化导致的不稳定
+    # 2. 根据任务需求，加载视觉模型
     if training_args.visual_und:  
+        if model_args.vit_type == "qwen2vl":
+            # Load Qwen2VL model, 是基于DFN（Dual-Feature Network）架构的视觉模型, qwen已经将固定位置编码替换成RoPR-2D
+            if training_args.finetune_from_hf:
+                vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
+            else:
+                vit_config = Qwen2VLVisionConfig.from_pretrained(model_args.vit_path)
+            vit_config.patch_size = 14
+            if training_args.finetune_from_hf:
+                vit_model = Qwen2VLVisionModel(vit_config)
+            else:
+                vit_model = Qwen2VLVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
+        elif model_args.vit_type == "siglip":
+            # Load SigLIP model (default)
+            if training_args.finetune_from_hf:
+                vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
+            else:
+                vit_config = SiglipVisionConfig.from_pretrained(model_args.vit_path)
+            vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer # 模型只会加载前 vit_config.num_hidden_layers 层
+            vit_config.rope = model_args.vit_rope # 是否使用 RoPE
+            if training_args.finetune_from_hf:
+                vit_model = SiglipVisionModel(vit_config)
+            else:
+                vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
+    
+    if training_args.visual_recon:
+        # Load DINOv2 model
         if training_args.finetune_from_hf:
-            vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
+            dino_config = Dinov2Config.from_json_file(os.path.join(model_args.model_path, "dino_config.json"))
         else:
-            vit_config = SiglipVisionConfig.from_pretrained(model_args.vit_path)
-        vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
-        vit_config.rope = model_args.vit_rope
+            dino_config = Dinov2Config.from_pretrained(model_args.dino_path)
+        # Adjust layers based on vit_select_layer if needed
         if training_args.finetune_from_hf:
-            vit_model = SiglipVisionModel(vit_config)
+            dino_model = Dinov2Model(dino_config)
         else:
-            vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
-
+            dino_model = Dinov2Model.from_pretrained(model_args.dino_path, config=dino_config)
+    
     if training_args.visual_gen:
         vae_model, vae_config = load_ae(
             local_path=os.path.join(model_args.model_path, "ae.safetensors") 
             if training_args.finetune_from_hf else model_args.vae_path
         )
 
+    # 3. 创建 BAGEL 模型
     config = BagelConfig(
         visual_gen=training_args.visual_gen,
+        visual_recon=training_args.visual_recon,
         visual_und=training_args.visual_und,
         llm_config=llm_config, 
         vit_config=vit_config if training_args.visual_und else None,
+        dino_config=dino_config if training_args.visual_recon else None,
         vae_config=vae_config if training_args.visual_gen else None,
         latent_patch_size=model_args.latent_patch_size,
         max_latent_size=model_args.max_latent_size,
@@ -519,10 +564,11 @@ def main():
     model = Bagel(
         language_model, 
         vit_model if training_args.visual_und else None, 
+        dino_model if training_args.visual_recon else None,
         config
     )
-
-    if training_args.visual_und:
+    # 重新配置视觉模型 (only for SigLIP)
+    if training_args.visual_und and model_args.vit_type == "siglip":
         model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
 
     total_param_count = count_parameters(model)
@@ -549,6 +595,11 @@ def main():
         model.vit_model.eval()
         for param in model.vit_model.parameters():
             param.requires_grad = False
+    if training_args.visual_recon:
+        # DINOv2 is typically frozen for reconstruction tasks
+        model.dino_model.eval()
+        for param in model.dino_model.parameters():
+            param.requires_grad = False
 
     # Setup FSDP and load pretrained model:
     fsdp_config = FSDPConfig(
@@ -559,6 +610,11 @@ def main():
         num_shard=training_args.num_shard,
     )
     ema_model = deepcopy(model)
+    # resume_from：从本地path覆盖当前权重, 结合前面的 finetune_from_hf, 会有四种组合
+    # 1. finetune_from_hf is False + resume_from is None: 预训练权重 全新训练
+    # 2. finetune_from_hf is False + resume_from is not None: 从本地恢复训练
+    # 3. finetune_from_hf is True (此时Bagel是随机权重) + resume_from is None: 保持随机初始化 (没意义)
+    # 4. finetune_from_hf is True + resume_from is not None: 从hf恢复训练 (第二阶段训练)
     model, ema_model = FSDPCheckpoint.try_load_ckpt(
         resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
     )
@@ -612,10 +668,11 @@ def main():
     with open(data_args.dataset_config_file, "r") as stream:
         dataset_meta = yaml.safe_load(stream)
     dataset_config = DataConfig(grouped_datasets=dataset_meta)
-    if training_args.visual_und:
+    # 动态配置注入
+    if training_args.visual_und: # 视觉理解分支
         dataset_config.vit_patch_size = model_args.vit_patch_size
         dataset_config.max_num_patch_per_side = model_args.vit_max_num_patch_per_side
-    if training_args.visual_gen:
+    if training_args.visual_gen: # 视觉生成分支
         vae_image_downsample = model_args.latent_patch_size * vae_config.downsample
         dataset_config.vae_image_downsample = vae_image_downsample
         dataset_config.max_latent_size = model_args.max_latent_size
@@ -641,7 +698,7 @@ def main():
     train_dataset.set_epoch(data_args.data_seed)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=1, # batch size is 1 packed dataset
+        batch_size=1, # batch size is 1 packed dataset, 因为 PackedDataset 已经将多个样本打包成一个"超级batch"
         num_workers=data_args.num_workers,
         pin_memory=True,
         collate_fn=collate_wrapper(),
