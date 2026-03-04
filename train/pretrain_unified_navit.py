@@ -28,9 +28,9 @@ from transformers.optimization import (
 from data.dataset_base import DataConfig, PackedDataset, collate_wrapper
 from data.data_utils import add_special_tokens
 from modeling.autoencoder import load_ae
-from modeling.bagel import (
-    BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
-)
+# from modeling.bagel import (
+#     BagelConfig, Bagel, Qwen2Config, Qwen2ForCausalLM, SiglipVisionConfig, SiglipVisionModel
+# )
 from transformers import Dinov2Config, Dinov2Model
 from modeling.qwen2 import Qwen2Tokenizer
 from train.train_utils import create_logger, get_latest_ckpt
@@ -38,7 +38,17 @@ from train.fsdp_utils import (
     FSDPCheckpoint, FSDPConfig, grad_checkpoint_check_fn, fsdp_wrapper, 
     fsdp_ema_setup, fsdp_ema_update,
 )
-
+from modeling.g2vlm import (
+    G2VLMConfig, 
+    G2VLM, 
+    Qwen2VLConfig,
+    Qwen2VLForCausalLM,
+    Dinov2WithRegistersConfig, Dinov2WithRegistersModel
+)
+from modeling.qwen2vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+# from modeling.qwen2vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+from transformers import Qwen2VLForConditionalGeneration
+from modeling.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
 
 def count_parameters(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
@@ -110,6 +120,10 @@ class ModelArguments:
         default=True,
         metadata={"help": "Enable QK LayerNorm (qk_norm) inside the attention blocks."}
     )
+    layer_scale: bool = field(
+        default=False,
+        metadata={"help": "Enable QK LayerNorm (qk_norm) inside the attention blocks."}
+    )
     tie_word_embeddings: bool = field(
         default=False,
         metadata={"help": "Share input and output word embeddings (tied embeddings)."}
@@ -149,6 +163,10 @@ class ModelArguments:
     vit_max_num_patch_per_side: int = field(
         default=70,
         metadata={"help": "Maximum number of ViT patches along one image side after cropping / resize."}
+    )
+    dino_max_num_patch_per_side: int = field(
+        default=37,
+        metadata={"help": "Maximum number of DINO patches along one image side after cropping / resize."}
     )
     connector_act: str = field(
         default="gelu_pytorch_tanh",
@@ -229,8 +247,52 @@ class TrainingArguments:
         metadata={"help": "Train image understanding branch."}
     )
     visual_recon: bool = field(
-        default=False,
+        default=True,
         metadata={"help": "Train image reconstruction branch with DINOv2."}
+    )
+    ssl: bool = field(
+        default=False,
+        metadata={"help": "Enable SSL (masked image reconstruction) pretraining objective."}
+    )
+    joint_train_recon: bool = field(
+        default=False,
+        metadata={"help": "Jointly train reconstruction with other tasks."}
+    )
+    pretrain_train_recon: bool = field(
+        default=False,
+        metadata={"help": "Pretrain reconstruction branch only."}
+    )
+    use_dinov3: bool = field(
+        default=False,
+        metadata={"help": "Use DINOv3 model instead of DINOv2."}
+    )
+    ce_loss_dino: bool = field(
+        default=False,
+        metadata={"help": "Apply cross-entropy loss on DINO tokens."}
+    )
+    train_conf_pi3: bool = field(
+        default=False,
+        metadata={"help": "Train confidence head in Pi3 decoder."}
+    )
+    use_registers: bool = field(
+        default=False,
+        metadata={"help": "Use register tokens in DINO patch sequence."}
+    )
+    use_dino_masking: bool = field(
+        default=False,
+        metadata={"help": "Enable masking on DINO patch tokens."}
+    )
+    dino_mask_mode: str = field(
+        default=None,
+        metadata={"help": "Masking mode for DINO tokens, e.g. 'random'. Comma-separated for multiple modes."}
+    )
+    dino_mask_ratio: str = field(
+        default=None,
+        metadata={"help": "Mask ratio for DINO tokens, e.g. '0.5'. Comma-separated for multiple ratios."}
+    )
+    dino_num_ref: int = field(
+        default=-1,
+        metadata={"help": "Number of reference views for DINO reconstruction (-1 = all)."}
     )
 
     # --- bookkeeping & logging ---
@@ -352,6 +414,10 @@ class TrainingArguments:
         default=1.0,
         metadata={"help": "Scaling factor for the language cross-entropy loss term."}
     )
+    ssl_weight: float = field(
+        default=1.0,
+        metadata={"help": "Scaling factor for the SSL masked image reconstruction loss term."}
+    )
     ce_loss_reweighting: bool = field(
         default=False,
         metadata={"help": "Reweight CE loss by token importance (provided via ce_loss_weights)."}
@@ -420,11 +486,11 @@ class TrainingArguments:
 
 def main():
     assert torch.cuda.is_available()
-    # dist.init_process_group("nccl")
+    # Let torchrun handle rank/world_size via env vars (RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT)
+    dist.init_process_group("nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    device = local_rank % torch.cuda.device_count()
-    torch.cuda.set_device(device)
-    dist.init_process_group("nccl", rank=local_rank, world_size=torch.cuda.device_count())
+    torch.cuda.set_device(local_rank)
+    device = local_rank
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     if training_args.peak_device_tflops <= 0:
@@ -437,6 +503,7 @@ def main():
         os.makedirs(training_args.results_dir, exist_ok=True)
         os.makedirs(training_args.checkpoint_dir, exist_ok=True)
         logger = create_logger(training_args.results_dir, dist.get_rank())
+        print(f"[rank 0] wandb.init starting...", flush=True)
         wandb.init(
             project=training_args.wandb_project, 
             id=f"{training_args.wandb_name}-run{training_args.wandb_runid}", 
@@ -445,6 +512,7 @@ def main():
             mode="offline" if training_args.wandb_offline else "online",
             settings=wandb.Settings(init_timeout=120)
         )
+        print(f"[rank 0] wandb.init finished!", flush=True)
         wandb.config.update(training_args)
         wandb.config.update(model_args)
         wandb.config.update(data_args)
@@ -454,10 +522,13 @@ def main():
             logger.warning("Peak device TFLOPs not set or auto-detected; MFU will report 0.")
     else:
         logger = create_logger(None, dist.get_rank())
+    print(f"[rank {dist.get_rank()}] reaching barrier...", flush=True)
     dist.barrier()
+    print(f'[rank {dist.get_rank()}] after barrier', flush=True)
     logger.info(f'Training arguments {training_args}')
     logger.info(f'Model arguments {model_args}')
     logger.info(f'Data arguments {data_args}')
+    print(f'Training arguments {training_args}')
 
     # prepare auto resume logic:
     if training_args.auto_resume:
@@ -483,24 +554,90 @@ def main():
     # Set seed:
     seed = training_args.global_seed * dist.get_world_size() + dist.get_rank()
     set_seed(seed)
-
+    print('set seed')
     # Setup model:
     # 1. 加载语言模型
     if training_args.finetune_from_hf:
-        llm_config = Qwen2Config.from_json_file(os.path.join(model_args.model_path, "llm_config.json")) # 从本地json文件直接加载配置，因为可能已经包含了Bagel的特有配置
+        llm_config = Qwen2VLConfig.from_json_file(os.path.join(model_args.model_path, "llm_config.json")) # 从本地json文件直接加载配置，因为可能已经包含了Bagel的特有配置
     else:
-        llm_config = Qwen2Config.from_pretrained(model_args.llm_path)
+        llm_config = Qwen2VLConfig.from_pretrained(model_args.llm_path)
     # 添加覆盖特有配置
-    llm_config.layer_module = model_args.layer_module # (arch) 指定使用哪个解码器层类（默认是 "Qwen2MoTDecoderLayer"）, BAGEL 的 MoT（Mixture of Tokens）架构的核心
-    llm_config.qk_norm = model_args.llm_qk_norm # (arch) 是否在注意力机制中启用 QK LayerNorm
-    llm_config.tie_word_embeddings = model_args.tie_word_embeddings # (arch) 是否共享输入和输出的词嵌入矩阵
-    llm_config.freeze_und = training_args.freeze_und # (grad) 是否冻结视觉理解（understanding）分支的连接器
+    # arch
+    llm_config.layer_module = model_args.layer_module # 指定使用哪个解码器层类（默认是 "Qwen2MoTDecoderLayer"）, BAGEL 的 MoT（Mixture of Tokens）架构的核心
+    llm_config.qk_norm = model_args.llm_qk_norm # 是否在注意力机制中启用 QK LayerNorm
+    llm_config.layer_scale = model_args.layer_scale
+    llm_config.tie_word_embeddings = model_args.tie_word_embeddings # 是否共享输入和输出的词嵌入矩阵
+
+    llm_config.freeze_und = training_args.freeze_und # 是否冻结视觉理解（understanding）分支的连接器
+    
     if training_args.finetune_from_hf:
-        language_model = Qwen2ForCausalLM(llm_config) # 只用配置初始化模型结构，不加载预训练权重, 权重会在后面通过 FSDPCheckpoint.try_load_ckpt() 从 BAGEL 完整模型中加载, 适用于从 hf/BAGEL-7B-MoT 这样的完整 BAGEL 模型继续训练
+        language_model = Qwen2VLForCausalLM(llm_config) # 只用配置初始化模型结构，不加载预训练权重, 权重会在后面通过 FSDPCheckpoint.try_load_ckpt() 从 BAGEL 完整模型中加载, 适用于从 hf/BAGEL-7B-MoT 这样的完整 BAGEL 模型继续训练
     else:
-        language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config) # 从 HuggingFace 预训练模型加载权重, 会读取 hf/Qwen2.5-0.5B-Instruct/ 中的 model.safetensors 等权重文件
-    if training_args.copy_init_moe:
-        language_model.init_moe() # 这个方法会复制初始化 MoE（Mixture of Experts）专家的权重, 确保每个专家在训练开始时有相同的初始化，避免随机初始化导致的不稳定
+        language_model = Qwen2VLForCausalLM.from_pretrained(model_args.llm_path, config=llm_config) # 从 HuggingFace 预训练模型加载权重, 会读取 hf/Qwen2.5-0.5B-Instruct/ 中的 model.safetensors 等权重文件
+        # 定制化的Qwen2VLForCausalLM和 原生qwen模型不一致
+        for name, param in language_model.named_parameters():
+            if 'ls1.gamma' in name or 'ls2.gamma' in name:
+                if llm_config.layer_scale:
+                    with torch.no_grad():
+                        param.data = torch.full_like(param, 0.01, device='cpu') if param.is_meta else param.data.fill_(0.01)
+            if 'q_norm' in name or 'k_norm' in name:
+                if llm_config.qk_norm:
+                    with torch.no_grad():
+                        param.data = param.data.fill_(1.0)
+        if training_args.copy_init_moe:
+            language_model.init_moe() # 这个方法会复制初始化 MoE（Mixture of Experts）专家的权重, 确保每个专家在训练开始时有相同的初始化，避免随机初始化导致的不稳定
+
+        # 检查并修复 LayerScale 参数初始化状态
+        if dist.get_rank() == 0:
+            print("=" * 80)
+            print("Checking NEW (not in checkpoint) parameters after language model initialization...")
+            # 检查所有新增模块的参数（不在原始 checkpoint 中的）
+            new_module_patterns = ['ls1.gamma', 'ls2.gamma', 'moe_geo', 'norm_moe_geo']
+            new_params = {}
+            for name, param in language_model.named_parameters():
+                # if any(pat in name for pat in new_module_patterns):
+                new_params[name] = {
+                    'shape': param.shape,
+                    'dtype': param.dtype,
+                    'device': param.device,
+                    'is_meta': param.is_meta,
+                    'min': param.min().item() if not param.is_meta else 'META',
+                    'max': param.max().item() if not param.is_meta else 'META',
+                    'mean': param.mean().item() if not param.is_meta else 'META',
+                    'has_nan': torch.isnan(param).any().item() if not param.is_meta else 'META',
+                    'has_inf': torch.isinf(param).any().item() if not param.is_meta else 'META',
+                    'all_zero': (param == 0).all().item() if not param.is_meta else 'META',
+                    'first_5': param.data.flatten()[:5].tolist() if not param.is_meta else 'META',
+                }
+            
+            if new_params:
+                print(f"Found {len(new_params)} NEW parameters (not in original checkpoint)")
+                problematic_count = 0
+                for name, stats in new_params.items():
+                    is_bad = stats['is_meta'] or stats['has_nan'] or stats['has_inf'] or stats['all_zero']
+                    marker = "⚠️" if is_bad else "✅"
+                    if is_bad:
+                        problematic_count += 1
+                    print(f"  {marker} {name}")
+                    print(f"      Shape: {stats['shape']}, Device: {stats['device']}, is_meta: {stats['is_meta']}")
+                    print(f"      min={stats['min']}, max={stats['max']}, mean={stats['mean']}")
+                    print(f"      has_nan={stats['has_nan']}, has_inf={stats['has_inf']}, all_zero={stats['all_zero']}")
+                    print(f"      First 5: {stats['first_5']}")
+                
+                if problematic_count > 0:
+                    print(f"\n⚠️ Found {problematic_count} problematic parameters! Reinitializing LayerScale...")
+                    for name, param in language_model.named_parameters():
+                        if 'ls1.gamma' in name or 'ls2.gamma' in name:
+                            if param.is_meta or torch.isnan(param).any() or torch.isinf(param).any():
+                                with torch.no_grad():
+                                    param.data = torch.full_like(param, 0.01, device='cpu') if param.is_meta else param.data.fill_(0.01)
+                                print(f"  ✅ Reinitialized {name} to 0.01")
+                else:
+                    print("✅ All new parameters look healthy!")
+            else:
+                print("No new parameters found in language model")
+            print("=" * 80)
+    
     # 2. 根据任务需求，加载视觉模型
     if training_args.visual_und:  
         if model_args.vit_type == "qwen2vl":
@@ -510,10 +647,13 @@ def main():
             else:
                 vit_config = Qwen2VLVisionConfig.from_pretrained(model_args.vit_path)
             vit_config.patch_size = 14
+            vit_config.initializer_range = 0.02
             if training_args.finetune_from_hf:
-                vit_model = Qwen2VLVisionModel(vit_config)
+                vit_model = Qwen2VisionTransformerPretrainedModel(vit_config)
             else:
-                vit_model = Qwen2VLVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
+                full = Qwen2VLForConditionalGeneration.from_pretrained(model_args.vit_path, device_map="cpu")
+                vit_model = full.model.visual
+                # vit_model = Qwen2VisionTransformerPretrainedModel.from_pretrained(model_args.vit_path, config=vit_config)
         elif model_args.vit_type == "siglip":
             # Load SigLIP model (default)
             if training_args.finetune_from_hf:
@@ -535,33 +675,43 @@ def main():
             dino_config = Dinov2Config.from_pretrained(model_args.dino_path)
         # Adjust layers based on vit_select_layer if needed
         if training_args.finetune_from_hf:
-            dino_model = Dinov2Model(dino_config)
+            dino_model = Dinov2WithRegistersModel(dino_config)
         else:
-            dino_model = Dinov2Model.from_pretrained(model_args.dino_path, config=dino_config)
+            dino_model = Dinov2WithRegistersModel.from_pretrained(model_args.dino_path, config=dino_config)
     
-    if training_args.visual_gen:
-        vae_model, vae_config = load_ae(
-            local_path=os.path.join(model_args.model_path, "ae.safetensors") 
-            if training_args.finetune_from_hf else model_args.vae_path
-        )
+    # if training_args.visual_gen:
+    #     vae_model, vae_config = load_ae(
+    #         local_path=os.path.join(model_args.model_path, "ae.safetensors") 
+    #         if training_args.finetune_from_hf else model_args.vae_path
+    #     )
 
     # 3. 创建 BAGEL 模型
-    config = BagelConfig(
-        visual_gen=training_args.visual_gen,
-        visual_recon=training_args.visual_recon,
+    config = G2VLMConfig(
         visual_und=training_args.visual_und,
+        visual_recon=training_args.visual_recon,
+        joint_train_recon=training_args.joint_train_recon,
+        pretrain_train_recon=training_args.pretrain_train_recon,
+        use_dinov3=training_args.use_dinov3,
+        ce_loss_dino=training_args.ce_loss_dino,
+        train_conf_pi3=training_args.train_conf_pi3,
+        ssl=training_args.ssl,
         llm_config=llm_config, 
         vit_config=vit_config if training_args.visual_und else None,
         dino_config=dino_config if training_args.visual_recon else None,
-        vae_config=vae_config if training_args.visual_gen else None,
+        # vae_config=vae_config if training_args.visual_gen else None,
         latent_patch_size=model_args.latent_patch_size,
         max_latent_size=model_args.max_latent_size,
         vit_max_num_patch_per_side=model_args.vit_max_num_patch_per_side,
-        connector_act=model_args.connector_act,
+        dino_max_num_patch_per_side=model_args.dino_max_num_patch_per_side,
         interpolate_pos=model_args.interpolate_pos,
-        timestep_shift=training_args.timestep_shift,
+        use_registers=training_args.use_registers,
+        use_dino_masking=training_args.use_dino_masking,
+        dino_mask_mode=training_args.dino_mask_mode.split(',') if training_args.dino_mask_mode else None,
+        dino_mask_ratio=[float(r) for r in training_args.dino_mask_ratio.split(',')] if training_args.dino_mask_ratio else None,
+        dino_num_ref=training_args.dino_num_ref,
     )
-    model = Bagel(
+    
+    model = G2VLM(
         language_model, 
         vit_model if training_args.visual_und else None, 
         dino_model if training_args.visual_recon else None,
@@ -582,11 +732,10 @@ def main():
         model.language_model.resize_token_embeddings(len(tokenizer))
         model.config.llm_config.vocab_size = len(tokenizer)
         model.language_model.config.vocab_size = len(tokenizer)
-
     # maybe freeze something:
-    if training_args.freeze_vae and training_args.visual_gen:
-        for param in vae_model.parameters():
-            param.requires_grad = False
+    # if training_args.freeze_vae and training_args.visual_gen:
+    #     for param in vae_model.parameters():
+    #         param.requires_grad = False
     if training_args.freeze_llm:
         model.language_model.eval()
         for param in model.language_model.parameters():
@@ -660,8 +809,9 @@ def main():
         train_step = 0
         data_status = None
     else:
-        optimizer, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
-            resume_from, optimizer, scheduler, fsdp_config, 
+        scaler = None
+        optimizer, scaler, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
+            resume_from, optimizer, scaler, scheduler, fsdp_config, 
         )
 
     # Setup packed dataloader
@@ -672,13 +822,13 @@ def main():
     if training_args.visual_und: # 视觉理解分支
         dataset_config.vit_patch_size = model_args.vit_patch_size
         dataset_config.max_num_patch_per_side = model_args.vit_max_num_patch_per_side
-    if training_args.visual_gen: # 视觉生成分支
-        vae_image_downsample = model_args.latent_patch_size * vae_config.downsample
-        dataset_config.vae_image_downsample = vae_image_downsample
-        dataset_config.max_latent_size = model_args.max_latent_size
-        dataset_config.text_cond_dropout_prob = model_args.text_cond_dropout_prob
-        dataset_config.vae_cond_dropout_prob = model_args.vae_cond_dropout_prob
-        dataset_config.vit_cond_dropout_prob = model_args.vit_cond_dropout_prob
+    # if training_args.visual_gen: # 视觉生成分支
+    #     vae_image_downsample = model_args.latent_patch_size * vae_config.downsample
+    #     dataset_config.vae_image_downsample = vae_image_downsample
+    #     dataset_config.max_latent_size = model_args.max_latent_size
+    #     dataset_config.text_cond_dropout_prob = model_args.text_cond_dropout_prob
+    #     dataset_config.vae_cond_dropout_prob = model_args.vae_cond_dropout_prob
+    #     dataset_config.vit_cond_dropout_prob = model_args.vit_cond_dropout_prob
     train_dataset = PackedDataset(
         dataset_config,
         tokenizer=tokenizer,
@@ -707,8 +857,8 @@ def main():
     )
 
     # Prepare models for training:
-    if training_args.visual_gen:
-        vae_model.to(device).eval()
+    # if training_args.visual_gen:
+    #     vae_model.to(device).eval()
     fsdp_model.train()
     ema_model.eval()
 
@@ -738,11 +888,11 @@ def main():
             seqlen_square_window += sample_square.item()
 
         with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16):
-            if training_args.visual_gen:
-                with torch.no_grad():
-                    data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
+            # if training_args.visual_gen:
+            #     with torch.no_grad():
+            #         data['padded_latent'] = vae_model.encode(data.pop('padded_images'))
             try:
-                loss_dict = fsdp_model(**data)
+                loss_dict, predictions = fsdp_model(**data)
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     logger.error(f"CUDA OOM at step {curr_step}: {e}")
@@ -753,12 +903,12 @@ def main():
         ce = loss_dict["ce"]
         if ce is not None:
             total_ce_tokens = torch.tensor(len(data['ce_loss_indexes']), device=device)
-            dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM)
+            dist.all_reduce(total_ce_tokens, op=dist.ReduceOp.SUM) # 所有GPU上的ce token总数
             if training_args.ce_loss_reweighting:
                 ce = ce * ce_loss_weights
                 total_ce_loss_weights = ce_loss_weights.sum()
                 dist.all_reduce(total_ce_loss_weights, op=dist.ReduceOp.SUM)
-                ce = ce.sum() * dist.get_world_size() / total_ce_loss_weights
+                ce = ce.sum() * dist.get_world_size() / total_ce_loss_weights # * dist.get_world_size()是因为 FSDP/DDP 在 backward() 时会自动对梯度求平均（除以 world_size）
             else:
                 ce = ce.sum() * dist.get_world_size() / total_ce_tokens
             loss_dict["ce"] = ce.detach()
@@ -768,21 +918,37 @@ def main():
             loss_dict["ce"] = torch.tensor(0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 
-        if training_args.visual_gen:
-            mse = loss_dict["mse"]
-            total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
-            dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
-            mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
-            loss_dict["mse"] = mse.detach()
-            loss = loss + mse * training_args.mse_weight
+        
+        # if training_args.visual_gen:
+        #     mse = loss_dict["mse"]
+        #     total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
+        #     dist.all_reduce(total_mse_tokens, op=dist.ReduceOp.SUM)
+        #     mse = mse.mean(dim=-1).sum() * dist.get_world_size() / total_mse_tokens
+        #     loss_dict["mse"] = mse.detach()
+        #     loss = loss + mse * training_args.mse_weight
+        # else:
+        #     assert not training_args.visual_gen
+        #     loss_dict["mse"] = torch.tensor(0, device=device)
+        #     total_mse_tokens = torch.tensor(0, device=device)
+
+        if training_args.ssl:
+            ssl_loss = loss_dict["ssl_loss"]
+            if ssl_loss is not None:
+                # ssl_loss 已经在 ConfLoss 中按 mask 归一化过了，是一个标量
+                # 乘以 world_size 补偿 DDP 的自动梯度平均
+                ssl_loss = ssl_loss * dist.get_world_size()
+                loss_dict["ssl_loss"] = ssl_loss.detach()
+                loss = loss + ssl_loss * training_args.ssl_weight
+            else:
+                loss_dict["ssl_loss"] = torch.tensor(0, device=device)
         else:
-            assert not training_args.visual_gen
-            loss_dict["mse"] = torch.tensor(0, device=device)
-            total_mse_tokens = torch.tensor(0, device=device)
+            loss_dict["ssl_loss"] = torch.tensor(0, device=device)
 
-        loss = loss / training_args.gradient_accumulation_steps
+        total_mse_tokens = torch.tensor(0, device=device)
+
+        loss = loss / training_args.gradient_accumulation_steps # 则每次只反传 1/n 的梯度，累积 n 个 micro-step 后才执行一次, 等价于用 n 倍的有效 batch size 训练。 
         loss.backward()
-
+        # 只有当累积了 n 个 micro-step 后，才做一次 clip → step → zero_grad。
         if (micro_step + 1) % training_args.gradient_accumulation_steps == 0:
             total_norm = fsdp_model.clip_grad_norm_(training_args.max_grad_norm)
             optimizer.step()
@@ -870,6 +1036,7 @@ def main():
                 model=fsdp_model, 
                 ema_model=ema_model, 
                 optimizer=optimizer, 
+                scaler=scaler,  # 添加这行
                 scheduler=scheduler, 
                 logger=logger,
                 fsdp_config=fsdp_config,
@@ -912,6 +1079,7 @@ def main():
             model=fsdp_model, 
             ema_model=ema_model, 
             optimizer=optimizer, 
+            scaler=scaler,  # 添加这行
             scheduler=scheduler, 
             logger=logger,
             fsdp_config=fsdp_config,
