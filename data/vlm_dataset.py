@@ -1,12 +1,9 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
-
 import json
 import os
 import traceback
 from PIL import Image, ImageFile, PngImagePlugin
 
-from .data_utils import pil_img2rgb
+from .data_utils import pil_img2rgb, apply_template_qwenvl2
 from .distributed_iterable_dataset import DistributedIterableDataset
 
 
@@ -16,10 +13,9 @@ MaximumDecompressedSize = 1024
 MegaByte = 2 ** 20
 PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
 
-
 class SftJSONLIterableDataset(DistributedIterableDataset):
     def __init__(
-        self, dataset_name, transform, tokenizer, frame_sampler, 
+        self, dataset_name, vit_transform, tokenizer, frame_sampler, 
         jsonl_path_list, data_dir_list, num_used_data, 
         local_rank=0, world_size=1, num_workers=8, data_status=None, 
         shuffle_lines=False, shuffle_seed=0,
@@ -30,7 +26,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
         num_used_data: list of number of sampled data points for each jsonl
         """
         super().__init__(dataset_name, local_rank, world_size, num_workers)
-        self.transform = transform
+        self.vit_transform = vit_transform
         self.tokenizer = tokenizer
         self.frame_sampler = frame_sampler
         self.data_status = data_status
@@ -99,7 +95,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
             row_start_id = self.data_status[worker_id] + 1
         else:
             row_start_id = 0
-        transform_stride = self.transform.stride
+        transform_stride = self.vit_transform.stride
 
         print(
             f"rank-{self.local_rank} worker-{worker_id} dataset-{self.dataset_name}: "
@@ -113,6 +109,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                 image_tensor_list = []
                 text_ids_list = []
                 sequence_plan = []
+                image_grid_thw_list = []
 
                 try:
                     data_item = json.loads(data)
@@ -123,13 +120,30 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                                 pil_img2rgb(Image.open(os.path.join(image_dir, image)))
                                 for image in data_item['image']
                             ]
+                            special_tokens = '<vit_image>' * len(raw_images)
+                            for item in data_item['conversations']:
+                                if item['from'] == "human":
+                                    if "<video>" in item['value']:
+                                        item['value'] = item['value'].replace("<video>", special_tokens).strip()
+                                    else:
+                                        item['value'] = special_tokens + " " + item['value']
+                                    break
+
                         else:
                             raw_images = [
                                 pil_img2rgb(Image.open(os.path.join(image_dir, data_item['image'])))
                             ]
+                            special_tokens = '<vit_image>' * len(raw_images)
+                            for item in data_item['conversations']:
+                                if item['from'] == "human":
+                                    if "<video>" in item['value']:
+                                        item['value'] = item['value'].replace("<video>", special_tokens).strip()
+                                    else:
+                                        item['value'] = special_tokens + item['value']
+                                    break
                     elif 'video' in data_item:
                         raw_images = self.frame_sampler(os.path.join(image_dir, data_item['video']))
-                        special_tokens = '<image>' * len(raw_images)
+                        special_tokens = '<vit_image>' * len(raw_images)
                         for item in data_item['conversations']:
                             if '<video>' in item['value']:
                                 item['value'] = item['value'].replace('<video>', special_tokens)
@@ -139,19 +153,23 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                 except:
                     traceback.print_exc()
                     continue
-
+                
+    
                 if raw_images:
                     for raw_image in raw_images:
-                        image_tensor = self.transform(raw_image, img_num=len(raw_images))
+                        image_tensor, image_grid_thw = self.vit_transform([raw_image], img_num=len(raw_images)) 
                         image_tensor_list.append(image_tensor)
-                        height, width = image_tensor.shape[1:]
-                        num_tokens += width * height // transform_stride ** 2
+                        image_grid_thw_list.append(image_grid_thw[0])
+                        num_tokens += image_tensor.shape[0] // 4
 
-                elements = self.change_format(data_item, len(image_tensor_list))
+                question = data_item['conversations'][0]["value"]
+                answer = data_item['conversations'][1]["value"]
+                split_list = apply_template_qwenvl2(question_with_image_tokens=question,answer=answer)
 
-                for item in elements:
+
+                for item in split_list:
                     if item['type'] == 'text':
-                        text_data = item['text']
+                        text_data = item['value']
                         text_ids = self.tokenizer.encode(text_data)
                         if len(text_ids) > 0:
                             text_ids_list.append(text_ids)
@@ -159,12 +177,12 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                             current_plan = {
                                 'type': 'text',
                                 'enable_cfg': 0,
-                                'loss': item['has_loss'],
+                                'loss': item['loss'],
                                 'special_token_loss': 0,
                                 'special_token_label': None,
                             }
                             sequence_plan.append(current_plan)
-                    elif item['type'] == 'image':
+                    elif item['type'] == 'vit':
                         current_plan = {
                             'type': 'vit_image',
                             'enable_cfg': 0,
@@ -182,6 +200,7 @@ class SftJSONLIterableDataset(DistributedIterableDataset):
                 yield dict(
                     image_tensor_list=image_tensor_list,
                     text_ids_list=text_ids_list,
+                    image_grid_thw_list=image_grid_thw_list,
                     sequence_plan=sequence_plan,
                     num_tokens=num_tokens,
                     data_indexes={

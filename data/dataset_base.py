@@ -1,15 +1,16 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
-
-
 import random
 import json
 
 import numpy as np
 import torch
+import torchvision.transforms as transforms
+from typing import Any, Dict, List, Mapping, Optional, Sequence
+
 
 from .data_utils import (
     get_flattened_position_ids_interpolate,
+    get_rope_index_image_3D,
+    get_rope_index_image_3D_dino,
     get_flattened_position_ids_extrapolate, 
     len2weight,
     patchify, 
@@ -17,7 +18,13 @@ from .data_utils import (
 )
 from .dataset_info import DATASET_INFO, DATASET_REGISTRY
 from .transforms import ImageTransform
+from .transforms_vggt import DinoImageTransform
+from .transforms import QwenVL2ImageTransform
 from .video_utils import FrameSampler
+from .augmentation_vggt import get_image_augmentation
+
+_RESNET_MEAN = [0.485, 0.456, 0.406]
+_RESNET_STD = [0.229, 0.224, 0.225]
 
 
 class DataConfig:
@@ -26,19 +33,21 @@ class DataConfig:
         grouped_datasets, 
         text_cond_dropout_prob=0.1,
         vit_cond_dropout_prob=0.4,
-        vae_cond_dropout_prob=0.1,
-        vae_image_downsample=16,
+        dino_cond_dropout_prob=0.4,
         max_latent_size=32,
         vit_patch_size=14,
-        max_num_patch_per_side=70,
+        dino_patch_size=14,
+        vit_max_num_patch_per_side=70,
+        dino_max_num_patch_per_side=37,
     ):
         self.grouped_datasets = grouped_datasets
         self.text_cond_dropout_prob = text_cond_dropout_prob
         self.vit_cond_dropout_prob = vit_cond_dropout_prob
         self.vit_patch_size = vit_patch_size
-        self.max_num_patch_per_side = max_num_patch_per_side
-        self.vae_cond_dropout_prob = vae_cond_dropout_prob
-        self.vae_image_downsample = vae_image_downsample
+        self.dino_cond_dropout_prob = dino_cond_dropout_prob
+        self.dino_patch_size = dino_patch_size
+        self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
+        self.dino_max_num_patch_per_side = dino_max_num_patch_per_side
         self.max_latent_size = max_latent_size
 
 
@@ -71,14 +80,28 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self.world_size = world_size
         self.num_workers = num_workers
         self.use_flex = use_flex
+        self.step_counter = 0
         for k, v in special_tokens.items():
             setattr(self, k, v)
+        
+        #added for aug 
+        self.cojitter = True  #common_config.augs.cojitter
+        # Probability of using shared jitter vs. frame-specific jitter
+        self.cojitter_ratio = 0.3  #common_config.augs.cojitter_ratio
+        # Initialize image augmentations (color jitter, grayscale, gaussian blur)
+        self.image_aug = get_image_augmentation(
+            gray_scale=True,
+            gau_blur=False,
+            color_jitter=None,
+        )
+  
+        self.resnet_normalize = transforms.Normalize(mean=_RESNET_MEAN, std=_RESNET_STD)
 
-        grouped_datasets, is_mandatory, grouped_weights = self.build_datasets(
+        grouped_names, grouped_datasets, is_mandatory, grouped_weights = self.build_datasets(
             data_config.grouped_datasets, data_status
         )
         self.grouped_datasets = grouped_datasets
-        self.dataset_iters = [iter(dataset) for dataset in grouped_datasets]
+        self.dataset_iters = [(iter(dataset), grouped_name, dataset) for (dataset, grouped_name) in zip(grouped_datasets, grouped_names)]          
         self.is_mandatory = is_mandatory
         self.grouped_weights = grouped_weights
         self.data_config = data_config
@@ -87,11 +110,24 @@ class PackedDataset(torch.utils.data.IterableDataset):
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
         else:
             self.get_flattened_position_ids = get_flattened_position_ids_extrapolate
+        
+        self.aspect_ratio_range = [0.5, 1.2] 
+        self.image_num_range = [2, 8] 
+        self.image_num_weights = {num_images: 1.0 for num_images in range(self.image_num_range[0], self.image_num_range[1]+1)}
+
+        self.possible_nums = np.array([n for n in self.image_num_weights.keys()
+                                    if self.image_num_range[0] <= n <= self.image_num_range[1]])
+
+        weights = [self.image_num_weights[n] for n in self.possible_nums]
+        self.normalized_weights = np.array(weights) / sum(weights)
+        self.base_and_epoch_seed = 42
+        self.step_counter = 0
 
     def build_datasets(self, datasets_metainfo, data_status):
         datasets = []
         is_mandatory = []
         grouped_weights = []
+        grouped_names = []
         for grouped_dataset_name, dataset_args in datasets_metainfo.items():
             is_mandatory.append(dataset_args.pop('is_mandatory', False))
             grouped_weights.append(dataset_args.pop('weight', 0.0))
@@ -103,8 +139,11 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 transform = ImageTransform(**dataset_args.pop('image_transform_args'))
                 dataset_args['transform'] = transform
             if 'vit_image_transform_args' in dataset_args.keys():
-                vit_transform = ImageTransform(**dataset_args.pop('vit_image_transform_args'))
+                vit_transform = QwenVL2ImageTransform(**dataset_args.pop('vit_image_transform_args'))
                 dataset_args['vit_transform'] = vit_transform
+            if 'dino_image_transform_args' in dataset_args.keys():
+                dino_transform = DinoImageTransform(**dataset_args.pop('dino_image_transform_args'))
+                dataset_args['dino_transform'] = dino_transform
 
             assert 'dataset_names' in dataset_args.keys()
             dataset_names = dataset_args.pop('dataset_names')
@@ -135,6 +174,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                         dataset_args['jsonl_path_list'] = [meta_info['jsonl_path']]
                     else:
                         dataset_args['jsonl_path_list'].append(meta_info['jsonl_path'])
+            print(f'Preparing Finished')
 
             resume_data_status = dataset_args.pop('resume_data_status', True)
             if data_status is not None and grouped_dataset_name in data_status.keys() and resume_data_status:
@@ -151,12 +191,14 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 **dataset_args
             )
             datasets.append(dataset)
+            grouped_names.append(grouped_dataset_name)
 
-        return datasets, is_mandatory, grouped_weights
+        return grouped_names, datasets, is_mandatory, grouped_weights
 
     def set_epoch(self, seed):
         for dataset in self.grouped_datasets:
             dataset.set_epoch(seed)
+        self.base_and_epoch_seed = seed
 
     def set_sequence_status(self):
         sequence_status = dict(
@@ -171,16 +213,26 @@ class PackedDataset(torch.utils.data.IterableDataset):
             packed_label_ids            = list(),
             ce_loss_indexes             = list(),
             ce_loss_weights             = list(),
-            vae_image_tensors           = list(), 
-            packed_latent_position_ids  = list(),
-            vae_latent_shapes           = list(), 
-            packed_vae_token_indexes    = list(), 
-            packed_timesteps            = list(), 
-            mse_loss_indexes            = list(),
+
+
+            dino_token_seqlens          = list(),
+            packed_dino_token_indexes   = list(), 
+            packed_depths               = list(),
+            packed_extrinsics           = list(),
+            packed_intrinsics           = list(),
+            packed_cam_points           = list(),
+            packed_world_points         = list(),
+            packed_point_masks          = list(),
+            packed_view_infos           = list(),
+            packed_image_paths           = list(),
+            packed_dino_image_tensor_list    = list(),
+            packed_image_grid_thw       = list(),
+
             packed_vit_tokens           = list(), 
+            packed_vit_images           = list(), 
             vit_token_seqlens           = list(),
-            packed_vit_position_ids     = list(),
             packed_vit_token_indexes    = list(), 
+            img_per_seq_lens            = list(), 
         )
         return sequence_status
 
@@ -190,42 +242,63 @@ class PackedDataset(torch.utils.data.IterableDataset):
             sample_lens=sequence_status['sample_lens'],
             packed_text_ids=torch.tensor(sequence_status['packed_text_ids']),
             packed_text_indexes=torch.tensor(sequence_status['packed_text_indexes']),
-            packed_position_ids=torch.tensor(sequence_status['packed_position_ids']),
+            packed_position_ids=torch.cat(sequence_status['packed_position_ids'], dim=1),
         )
         if not self.use_flex:
             data['nested_attention_masks'] = sequence_status['nested_attention_masks']
         else:
             sequence_len = data['sequence_length']
-            pad_len = self.max_num_tokens - sequence_len
+            pad_len = self.max_num_tokens - sequence_len #### this is fixed only postive num
             data['split_lens'] = sequence_status['split_lens'] + [pad_len]
             data['attn_modes'] = sequence_status['attn_modes'] + ['causal']
             data['sample_lens'] += [pad_len]
+        
+        if len(sequence_status['packed_dino_image_tensor_list']) > 0: 
 
-        # if the model has a convnet vae (e.g., as visual tokenizer)
-        if len(sequence_status['vae_image_tensors']) > 0:
-            image_tensors = sequence_status.pop('vae_image_tensors')
-            image_sizes = [item.shape for item in image_tensors]
-            max_image_size = [max(item) for item in list(zip(*image_sizes))]
-            padded_images = torch.zeros(size=(len(image_tensors), *max_image_size))
-            for i, image_tensor in enumerate(image_tensors):
-                padded_images[i, :, :image_tensor.shape[1], :image_tensor.shape[2]] = image_tensor
+            data['packed_dino_token_indexes'] = torch.tensor(sequence_status['packed_dino_token_indexes'])
+            data['dino_token_seqlens'] = torch.tensor(sequence_status['dino_token_seqlens'])
 
-            data['padded_images'] = padded_images
-            data['patchified_vae_latent_shapes'] = sequence_status['vae_latent_shapes']
-            data['packed_latent_position_ids'] = torch.cat(sequence_status['packed_latent_position_ids'], dim=0)
-            data['packed_vae_token_indexes'] = torch.tensor(sequence_status['packed_vae_token_indexes'])
 
-        # if the model has a vit (e.g., as visual tokenizer)
-        if len(sequence_status['packed_vit_tokens']) > 0:
-            data['packed_vit_tokens'] = torch.cat(sequence_status['packed_vit_tokens'], dim=0)
-            data['packed_vit_position_ids'] = torch.cat(sequence_status['packed_vit_position_ids'], dim=0)
+            packed_dino_image_tensors = torch.from_numpy(np.stack(sequence_status["packed_dino_image_tensor_list"]).astype(np.float32)).contiguous()
+            packed_dino_image_tensors = packed_dino_image_tensors.permute(0,3,1,2).to(torch.get_default_dtype()).div(255)
+
+            if self.image_aug is not None:
+                if self.cojitter and random.random() > self.cojitter_ratio:
+                    # Apply the same color jittering transformation to all frames
+                    packed_dino_image_tensors = self.image_aug(packed_dino_image_tensors)
+                else:
+                    # Apply different color jittering to each frame individually
+                    for aug_img_idx in range(len(packed_dino_image_tensors)):
+                        packed_dino_image_tensors[aug_img_idx] = self.image_aug(packed_dino_image_tensors[aug_img_idx])
+            
+            packed_dino_image_tensors = packed_dino_image_tensors.contiguous()
+
+            depths = torch.from_numpy(np.stack(sequence_status["packed_depths"]).astype(np.float32)).to(torch.float32)
+            extrinsics = torch.from_numpy(np.stack(sequence_status["packed_extrinsics"]).astype(np.float32)).to(torch.float32)
+            intrinsics = torch.from_numpy(np.stack(sequence_status["packed_intrinsics"]).astype(np.float32)).to(torch.float32)
+            world_points = torch.from_numpy(np.stack(sequence_status["packed_world_points"]).astype(np.float32)).to(torch.float32)
+            point_masks = torch.from_numpy(np.stack(sequence_status["packed_point_masks"])) # Mask indicating valid depths / world points / cam points per frame
+
+            data["packed_depths"] = depths             
+            data["packed_extrinsics"] =  extrinsics
+            data["packed_intrinsics"] = intrinsics
+            # data["packed_cam_points"] = cam_points
+            data["packed_world_points"] = world_points
+            data["packed_point_masks"] = point_masks
+            # packed_dino_image_tensors = torch.stack(sequence_status["packed_dino_image_tensor_list"], dim=0)
+
+            packed_dino_image_tensors = self.resnet_normalize(packed_dino_image_tensors)
+            data["packed_dino_image_tensor_list"]  = packed_dino_image_tensors
+            data['img_per_seq_lens'] = sequence_status['img_per_seq_lens']
+            data['packed_view_infos'] = sequence_status["packed_view_infos"]
+            data['packed_image_paths'] = sequence_status["packed_image_paths"]
+            
+
+        if len(sequence_status['packed_vit_images']) > 0:
+            data['packed_vit_images'] =  torch.stack(sequence_status['packed_vit_images'], dim=0)
             data['packed_vit_token_indexes'] = torch.tensor(sequence_status['packed_vit_token_indexes'])
             data['vit_token_seqlens'] = torch.tensor(sequence_status['vit_token_seqlens'])
-
-        # if the model is required to perform visual generation
-        if len(sequence_status['packed_timesteps']) > 0:
-            data['packed_timesteps'] = torch.tensor(sequence_status['packed_timesteps'])
-            data['mse_loss_indexes'] = torch.tensor(sequence_status['mse_loss_indexes'])
+            data['packed_image_grid_thw'] = torch.stack(sequence_status['packed_image_grid_thw'], dim=0)
 
         # if the model is required to perform text generation
         if len(sequence_status['packed_label_ids']) > 0:
@@ -239,64 +312,106 @@ class PackedDataset(torch.utils.data.IterableDataset):
         total_weights = sum(self.grouped_weights)
         assert total_weights > 0.0
         group_cumprobs = [sum(self.grouped_weights[:i + 1]) / total_weights 
-                          for i in range(len(self.grouped_weights))]
+                        for i in range(len(self.grouped_weights))]
         sequence_status = self.set_sequence_status()
         batch_data_indexes = []
 
-        buffer = []
+        # 调试计数器
+        loop_count = 0
+        yield_count = 0
+        skip_count = 0
+
         while True:
+            loop_count += 1
+            self.step_counter += 1
+            step_seed = self.base_and_epoch_seed + self.step_counter
+            step_rng = random.Random(step_seed)
+            
+            random_image_num = int(step_rng.choices(
+                self.possible_nums, 
+                weights=self.normalized_weights,
+                k=1
+            )[0])
+            random_aspect_ratio = round(
+                step_rng.uniform(self.aspect_ratio_range[0], self.aspect_ratio_range[1]), 
+                2
+            )      
+
+            # 打印循环状态
+            # if loop_count % 10 == 1:  # 每10次打印一次
+            #     print(f"\n{'='*60} \n [Rank {self.local_rank} Worker ] ")
+            #     print(f"[Loop #{loop_count}] step_counter={self.step_counter}")
+            #     print(f"  random_image_num={random_image_num}, random_aspect_ratio={random_aspect_ratio}")
+            #     print(f"  curr_tokens={sequence_status['curr']}, num_samples={len(sequence_status['sample_lens'])}")
+            #     print(f"  yield_count={yield_count}, skip_count={skip_count}")
+            
             # Ensure at least one sample from each group
+            # sequence_status['curr'] 是累计的 token 数量
             if sequence_status['curr'] == 0:
-                for group_index, group_iter in enumerate(self.dataset_iters):
-                    if self.is_mandatory[group_index]:
+                # print(f"[Rank {self.local_rank} Worker ]  [NEW BATCH] Starting fresh batch...")
+                for group_index, group_iter_names in enumerate(self.dataset_iters):
+                    group_iter = group_iter_names[0]
+                    group_name = group_iter_names[1]
+                    group_dataset = group_iter_names[2]  
+                    if self.is_mandatory[group_index]: #grouped means recon group.  
+                        # print(f"[Rank {self.local_rank} Worker ] Loading mandatory group: {group_name}")
                         while True:
-                            sample = next(group_iter)
-                            # if a sample is too long, skip it
-                            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
+                            if group_name == "recon":
+                                group_dataset.set_random_image_num(random_image_num)
+                                group_dataset.set_random_aspect_ratio(random_aspect_ratio)
+                                group_dataset.set_step_rng(step_seed)
+                                sample = next(group_iter)
+                            else:
+                                sample = next(group_iter)
+                                
+                            if sample is None:
+                                continue
+                            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan']) # 样本本身的 token 数量，包括文本 token 和图像 token（vit 或 dino）等内容 token, 为 sequence_plan 中的每个 item 额外预留 2 个 token
                             if num_tokens < self.max_num_tokens_per_sample:
                                 sequence_status = self.pack_sequence(sample, sequence_status)
                                 batch_data_indexes.append(sample['data_indexes'])
+                                print(f"    Added mandatory sample: {num_tokens} tokens, curr={sequence_status['curr']}")
                                 break
                             else:
-                                print(f"skip a sample with length {num_tokens}")
+                                print(f"[Rank {self.local_rank} Worker ] skip a sample with length {num_tokens}")
                                 continue
 
-            if sequence_status['curr'] < self.prefer_buffer_before and len(buffer) > 0:
-                sample = buffer.pop(0)
-                sample_from_buffer = True
-            else:
-                # sample normally across all groups
-                n = random.random()
-                group_index = 0
-                for i, cumprob in enumerate(group_cumprobs):
-                    if n < cumprob:
-                        group_index = i
-                        break
-                sample = next(self.dataset_iters[group_index])
-                sample_from_buffer = False
-
-            # if a sample is too long, skip it
+            n = random.random()
+            group_index = 0
+            for i, cumprob in enumerate(group_cumprobs):
+                if n < cumprob:
+                    group_index = i
+                    break
+            # 采样一个新数据sequence
+            sample = next(self.dataset_iters[group_index][0])
+            # 数据的长度，等待加入
+            
             num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
+            # 1. 单样本检查 - 太长的样本直接跳过
             if num_tokens > self.max_num_tokens_per_sample:
-                print(f"skip a sample with length {num_tokens}")
+                print(f"[Rank {self.local_rank} Worker ] skip a sample with length {num_tokens}")
+                skip_count += 1
                 continue
 
+            # 2. 硬上限检查 - 添加前检查，防止超限
             if sequence_status['curr'] + num_tokens > self.max_num_tokens:
-                if len(buffer) < self.max_buffer_size and not sample_from_buffer:
-                    buffer.append(sample)
-                else:
-                    print(f"Yielding data with length {sum(sequence_status['sample_lens'])}")
-                    data = self.to_tensor(sequence_status)
-                    data['batch_data_indexes'] = batch_data_indexes
-                    yield data
-                    sequence_status = self.set_sequence_status()
-                    batch_data_indexes = []
+                yield_count += 1
+                data = self.to_tensor(sequence_status)
+                data['batch_data_indexes'] = batch_data_indexes
+                yield data
+                sequence_status = self.set_sequence_status()
+                batch_data_indexes = []
                 continue
-
+            
+            # 如果没有超过硬上限，就会被加入
             sequence_status = self.pack_sequence(sample, sequence_status)
             batch_data_indexes.append(sample['data_indexes'])
 
+            # 3. 软目标检查 - 添加后检查，达到目标即返回
             if sequence_status['curr'] >= self.expected_num_tokens:
+                yield_count += 1
+                print(f"[Rank {self.local_rank} Worker  Loop {loop_count}] Yield #{yield_count}: "
+                      f"tokens={sum(sequence_status['sample_lens'])}, samples={len(sequence_status['sample_lens'])}")
                 data = self.to_tensor(sequence_status)
                 data['batch_data_indexes'] = batch_data_indexes
                 yield data
@@ -304,14 +419,44 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 batch_data_indexes = []
 
     def pack_sequence(self, sample, sequence_status):
-        image_tensor_list = sample['image_tensor_list']
+        if 'image_tensor_list' in sample:
+            image_tensor_list = sample['image_tensor_list']
+        if 'image_grid_thw_list' in sample: 
+            image_grid_thw_list = sample['image_grid_thw_list']
         text_ids_list = sample['text_ids_list']
         sequence_plan = sample['sequence_plan']
+
+        img_per_seq = 0
+        if 'depths' in sample:
+            depth_array =sample['depths']
+        if 'extrinsics' in sample:
+            extrinsics_array =sample['extrinsics']
+        if 'intrinsics' in sample:
+            intrinsics_array =sample['intrinsics']
+        if 'world_points' in sample:
+            world_points_array =sample['world_points']
+        if 'point_masks' in sample:
+            point_masks_array =sample['point_masks']
+        if 'view_infos' in sample:
+            view_infos =sample['view_infos']
+        if 'image_paths' in sample:
+            image_paths =sample['image_paths']
+        if 'img_per_seq' in sample: 
+            img_per_seq = sample['img_per_seq']
+        if 'dino_image_tensor_list' in sample: 
+            dino_image_tensor_list = sample['dino_image_tensor_list']
+        if 'dino_images' in sample: 
+            dino_images = sample['dino_images']
+        if 'dino_thw' in sample: 
+            dino_thw = sample['dino_thw']
 
         split_lens, attn_modes = list(), list()
         curr = sequence_status['curr']
         curr_rope_id = 0
         sample_lens = 0
+        vit_cnt = 0
+        dino_cnt = 0
+
 
         for item in sequence_plan:
             split_start = item.get('split_start', True)
@@ -323,61 +468,167 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 if item['enable_cfg'] == 1 and random.random() < self.data_config.text_cond_dropout_prob:
                     continue
 
-                shifted_text_ids = [self.bos_token_id] + text_ids
+                shifted_text_ids = text_ids
                 sequence_status['packed_text_ids'].extend(shifted_text_ids)
                 sequence_status['packed_text_indexes'].extend(range(curr, curr + len(shifted_text_ids)))
+
+                # \n text_token  <-> text_token <|im_end|>
                 if item['loss'] == 1:
                     sequence_status['ce_loss_indexes'].extend(range(curr, curr + len(shifted_text_ids)))
                     sequence_status['ce_loss_weights'].extend(
                         [len2weight(len(shifted_text_ids))] * len(shifted_text_ids)
                     )
-                    sequence_status['packed_label_ids'].extend(text_ids + [self.eos_token_id])
+                    sequence_status['packed_label_ids'].extend(text_ids[1:] + [self.eos_token_id])
                 curr += len(shifted_text_ids)
                 curr_split_len += len(shifted_text_ids)
 
-                # add a <|im_end|> token
-                sequence_status['packed_text_ids'].append(self.eos_token_id)
+                if item['loss'] == 1:
+                    sequence_status['packed_text_ids'].append(self.eos_token_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
+
+                attn_modes.append("causal")
+                pos_ids = torch.tensor(range(curr_rope_id, curr_rope_id + curr_split_len), dtype=torch.long).expand(3, -1),
+                sequence_status['packed_position_ids'].extend(pos_ids)
+                curr_rope_id += curr_split_len
+
+            elif item['type'] == 'vit_image':
+                vit_cnt += 1
+
+
+                image_tensor = image_tensor_list.pop(0)
+                image_grid_thw = image_grid_thw_list.pop(0)
+
+                if item['enable_cfg'] == 1 and random.random() < self.data_config.vit_cond_dropout_prob:
+                    curr_rope_id += 1
+                    continue
+
+                sequence_status['packed_text_ids'].append(self.start_of_image)
                 sequence_status['packed_text_indexes'].append(curr)
-                if item['special_token_loss'] == 1: # <|im_end|> may have loss
+                curr += 1
+                curr_split_len += 1
+
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+
+                num_img_tokens =  image_tensor.shape[0] // 4
+                sequence_status['packed_vit_token_indexes'].extend(range(curr, curr + num_img_tokens))
+                curr += num_img_tokens
+                curr_split_len += num_img_tokens
+
+                sequence_status['packed_vit_images'].append(image_tensor)
+                sequence_status['vit_token_seqlens'].append(num_img_tokens)
+                sequence_status['packed_image_grid_thw'].append(image_grid_thw)
+
+                postions_ids_from_vit_for_rope, rope_deltas = get_rope_index_image_3D(
+                    image_grid_thw,
+                    curr_rope_id,
+                    device=image_tensor.device
+                )
+
+                sequence_status['packed_position_ids'].extend([postions_ids_from_vit_for_rope])
+                curr_rope_id += rope_deltas + 1
+
+                sequence_status['packed_text_ids'].append(self.end_of_image)
+                sequence_status['packed_text_indexes'].append(curr)
+                if item['special_token_loss'] == 1: # <|endofimage|> may have loss
                     sequence_status['ce_loss_indexes'].append(curr)
                     sequence_status['ce_loss_weights'].append(1.0)
                     sequence_status['packed_label_ids'].append(item['special_token_label'])
                 curr += 1
                 curr_split_len += 1
 
-                # update sequence status
-                attn_modes.append("causal")
-                sequence_status['packed_position_ids'].extend(range(curr_rope_id, curr_rope_id + curr_split_len))
-                curr_rope_id += curr_split_len
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
 
-            elif item['type'] == 'vit_image':
-                image_tensor = image_tensor_list.pop(0)
-                if item['enable_cfg'] == 1 and random.random() < self.data_config.vit_cond_dropout_prob:
-                    curr_rope_id += 1
-                    continue
+                attn_modes.append("full") # changed to noise
+       
 
-                # add a <|startofimage|> token
+            elif item['type'] == 'dino_image':
+                dino_cnt+=1
+                use_registers = False
+                use_camera_token = False 
+
+                dino_image_thw = dino_thw.pop(0)
+                image_tensor = dino_image_tensor_list.pop(0)
+                dino_image = dino_images.pop(0)
+                depths_np = depth_array.pop(0)
+                extrinsics_np = extrinsics_array.pop(0)
+                intrinsics_np = intrinsics_array.pop(0)
+                world_points_np  = world_points_array.pop(0)
+                point_masks_np = point_masks_array.pop(0)               
+
+                if 'view_infos' in sample:
+                    view_info_str = view_infos.pop(0)
+                else:
+                    view_info_str = ''
+                    
+                if 'image_paths' in sample:
+                    image_path_str = image_paths.pop(0)
+                else:
+                    image_path_str = ''
+                
+                sequence_status["packed_depths"].append(depths_np)               
+                sequence_status["packed_extrinsics"].append(extrinsics_np)  
+                sequence_status["packed_intrinsics"].append(intrinsics_np)  
+                sequence_status["packed_world_points"].append(world_points_np)  
+                sequence_status["packed_point_masks"].append(point_masks_np)  
+                sequence_status["packed_view_infos"].append(view_info_str)  
+                sequence_status["packed_image_paths"].append(image_path_str)  
+                sequence_status["packed_dino_image_tensor_list"].append(dino_image)  
+
                 sequence_status['packed_text_ids'].append(self.start_of_image)
                 sequence_status['packed_text_indexes'].append(curr)
                 curr += 1
                 curr_split_len += 1
+                
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+                if use_camera_token:
+                    pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                    sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                    curr_rope_id += 1 
+
+                if use_registers:
+                    for _ in range(4):
+                        pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                        sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                        curr_rope_id += 1
 
                 # preprocess image
-                vit_tokens = patchify(image_tensor, self.data_config.vit_patch_size)
-                num_img_tokens = vit_tokens.shape[0]
-                sequence_status['packed_vit_token_indexes'].extend(range(curr, curr + num_img_tokens))
-                curr += num_img_tokens
-                curr_split_len += num_img_tokens
+                dino_tokens = patchify(image_tensor, self.data_config.dino_patch_size)
+                num_img_tokens = dino_tokens.shape[0]
+                # note: +1 is for one camera token 
+                
+                if use_registers:
+                    sequence_status['packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens +1 + 4))
+                    curr += num_img_tokens + 1 + 4
+                    curr_split_len += num_img_tokens + 1 +4 
+                elif use_camera_token:
+                    sequence_status['packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens + 1))
+                    curr += num_img_tokens + 1 
+                    curr_split_len += num_img_tokens + 1
+                else:
+                    sequence_status['packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens ))
+                    curr += num_img_tokens 
+                    curr_split_len += num_img_tokens 
 
-                sequence_status['packed_vit_tokens'].append(vit_tokens)
-                sequence_status['vit_token_seqlens'].append(num_img_tokens)
-                sequence_status['packed_vit_position_ids'].append(
-                    self.get_flattened_position_ids(
-                        image_tensor.size(1), image_tensor.size(2),
-                        self.data_config.vit_patch_size, 
-                        max_num_patches_per_side=self.data_config.max_num_patch_per_side
-                    )
+                # sequence_status['packed_dino_tokens'].append(dino_tokens)
+                sequence_status['dino_token_seqlens'].append(num_img_tokens)
+
+                postions_ids_from_dino_for_rope, rope_deltas = get_rope_index_image_3D_dino(
+                    dino_image_thw,
+                    curr_rope_id,
+                    device=image_tensor.device
                 )
+                sequence_status['packed_position_ids'].extend([postions_ids_from_dino_for_rope])
+                curr_rope_id += rope_deltas + 1
 
                 # add a <|endofimage|> token
                 sequence_status['packed_text_ids'].append(self.end_of_image)
@@ -389,73 +640,13 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 curr += 1
                 curr_split_len += 1
 
-                # update sequence status
-                attn_modes.append("full")
-                sequence_status['packed_position_ids'].extend([curr_rope_id] * curr_split_len)
+                # add a <|endofimage|> token 3d rope pos
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
                 curr_rope_id += 1
 
-            elif item['type'] == 'vae_image':
-                image_tensor = image_tensor_list.pop(0)
-                if item['enable_cfg'] == 1 and random.random() < self.data_config.vae_cond_dropout_prob:
-                    # FIXME fix vae dropout in video2video setting.
-                    curr_rope_id += 1
-                    continue
-
-                # add a <|startofimage|> token
-                sequence_status['packed_text_ids'].append(self.start_of_image)
-                sequence_status['packed_text_indexes'].append(curr)
-                curr += 1
-                curr_split_len += 1
-
-                # preprocess image
-                sequence_status['vae_image_tensors'].append(image_tensor)
-                sequence_status['packed_latent_position_ids'].append(
-                    self.get_flattened_position_ids(
-                        image_tensor.size(1), image_tensor.size(2),
-                        self.data_config.vae_image_downsample, 
-                        max_num_patches_per_side=self.data_config.max_latent_size
-                    )
-                )
-                H, W = image_tensor.shape[1:]
-                h = H // self.data_config.vae_image_downsample
-                w = W // self.data_config.vae_image_downsample
-                sequence_status['vae_latent_shapes'].append((h, w))
-
-                num_img_tokens = w * h
-                sequence_status['packed_vae_token_indexes'].extend(range(curr, curr + num_img_tokens))
-                if item['loss'] == 1:
-                    sequence_status['mse_loss_indexes'].extend(range(curr, curr + num_img_tokens))
-                    if split_start:
-                        timestep = np.random.randn()
-                else:
-                    timestep = float('-inf')
-
-                sequence_status['packed_timesteps'].extend([timestep] * num_img_tokens)
-                curr += num_img_tokens
-                curr_split_len += num_img_tokens
-
-                # add a <|endofimage|> token
-                sequence_status['packed_text_ids'].append(self.end_of_image)
-                sequence_status['packed_text_indexes'].append(curr)
-                # <|endofimage|> may have loss
-                if item['special_token_loss'] == 1:
-                    sequence_status['ce_loss_indexes'].append(curr)
-                    sequence_status['ce_loss_weights'].append(1.0)
-                    sequence_status['packed_label_ids'].append(item['special_token_label'])
-                curr += 1
-                curr_split_len += 1
-
                 # update sequence status
-                if split_start:
-                    if item['loss'] == 1 and 'frame_delta' not in item.keys():
-                        attn_modes.append("noise")
-                    else:
-                        attn_modes.append("full")
-                sequence_status['packed_position_ids'].extend([curr_rope_id] * (num_img_tokens + 2))
-                if 'frame_delta' in item.keys():
-                    curr_rope_id += item['frame_delta']
-                elif item['loss'] == 0:
-                    curr_rope_id += 1
+                attn_modes.append("full")
 
             if item.get('split_end', True):
                 split_lens.append(curr_split_len)
@@ -463,6 +654,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
         sequence_status['curr'] = curr
         sequence_status['sample_lens'].append(sample_lens)
+        sequence_status["img_per_seq_lens"].append(img_per_seq)
         # prepare attention mask
         if not self.use_flex:
             sequence_status['nested_attention_masks'].append(
@@ -473,7 +665,6 @@ class PackedDataset(torch.utils.data.IterableDataset):
             sequence_status['attn_modes'].extend(attn_modes)
 
         return sequence_status
-
 
 class SimpleCustomBatch:
     def __init__(self, batch):
@@ -493,21 +684,26 @@ class SimpleCustomBatch:
         else:
             self.nested_attention_masks = data["nested_attention_masks"]
 
-        if "padded_images" in data.keys():
-            self.padded_images = data["padded_images"]
-            self.patchified_vae_latent_shapes = data["patchified_vae_latent_shapes"]
-            self.packed_latent_position_ids = data["packed_latent_position_ids"]
-            self.packed_vae_token_indexes = data["packed_vae_token_indexes"]
+        if "packed_dino_image_tensor_list" in data.keys():
 
-        if "packed_vit_tokens" in data.keys():
-            self.packed_vit_tokens = data["packed_vit_tokens"]
-            self.packed_vit_position_ids = data["packed_vit_position_ids"]
+            self.packed_dino_token_indexes = data['packed_dino_token_indexes']
+            self.dino_token_seqlens = data["dino_token_seqlens"]
+
+            self.packed_depths =  data["packed_depths"]          
+            self.packed_extrinsics =  data["packed_extrinsics"] 
+            self.packed_intrinsics =  data["packed_intrinsics"]
+            self.packed_world_points =  data["packed_world_points"]
+            self.packed_point_masks = data["packed_point_masks"] 
+            self.packed_dino_image_tensor_list = data["packed_dino_image_tensor_list"]
+            self.img_per_seq_lens = data["img_per_seq_lens"]
+            self.packed_view_infos = data['packed_view_infos']
+            self.packed_image_paths = data['packed_image_paths']
+
+        if "packed_vit_images" in data.keys():
+            self.packed_vit_images = data["packed_vit_images"]
+            self.packed_image_grid_thw = data["packed_image_grid_thw"]
             self.packed_vit_token_indexes = data["packed_vit_token_indexes"]
             self.vit_token_seqlens = data["vit_token_seqlens"]
-
-        if "packed_timesteps" in data.keys():
-            self.packed_timesteps = data["packed_timesteps"]
-            self.mse_loss_indexes = data["mse_loss_indexes"]
 
         if "packed_label_ids" in data.keys():
             self.packed_label_ids = data["packed_label_ids"]
@@ -522,18 +718,20 @@ class SimpleCustomBatch:
         if not self.use_flex:
             self.nested_attention_masks = [item.pin_memory() for item in self.nested_attention_masks]
 
-        if hasattr(self, 'padded_images'):
-            self.padded_images = self.padded_images.pin_memory()
-            self.packed_vae_token_indexes = self.packed_vae_token_indexes.pin_memory()
-            self.packed_latent_position_ids = self.packed_latent_position_ids.pin_memory()
+        if hasattr(self, 'packed_dino_image_tensor_list'):
+            self.packed_dino_token_indexes = self.packed_dino_token_indexes.pin_memory()
+            self.dino_token_seqlens = self.dino_token_seqlens.pin_memory()
 
-        if hasattr(self, 'packed_timesteps'):
-            self.packed_timesteps = self.packed_timesteps.pin_memory()
-            self.mse_loss_indexes = self.mse_loss_indexes.pin_memory()
+            self.packed_depths =  self.packed_depths.pin_memory()     
+            self.packed_extrinsics =  self.packed_extrinsics.pin_memory()  
+            self.packed_intrinsics =  self.packed_intrinsics.pin_memory()  
+            self.packed_world_points =  self.packed_world_points.pin_memory()  
+            self.packed_point_masks = self.packed_point_masks.pin_memory()  
+            self.packed_dino_image_tensor_list = self.packed_dino_image_tensor_list.pin_memory()
 
-        if hasattr(self, 'packed_vit_tokens'):
-            self.packed_vit_tokens = self.packed_vit_tokens.pin_memory()
-            self.packed_vit_position_ids = self.packed_vit_position_ids.pin_memory()
+        if hasattr(self, 'packed_vit_images'):
+            self.packed_vit_images = self.packed_vit_images.pin_memory()
+            self.packed_image_grid_thw = self.packed_image_grid_thw.pin_memory()
             self.packed_vit_token_indexes = self.packed_vit_token_indexes.pin_memory()
             self.vit_token_seqlens = self.vit_token_seqlens.pin_memory()
 
@@ -544,33 +742,35 @@ class SimpleCustomBatch:
 
         return self
 
-    def cuda(self, device):
-        self.packed_text_ids = self.packed_text_ids.to(device)
-        self.packed_text_indexes = self.packed_text_indexes.to(device)
-        self.packed_position_ids = self.packed_position_ids.to(device)
+    def cuda(self, device=None, non_blocking=False):
+        self.packed_text_ids = self.packed_text_ids.to(device, non_blocking=non_blocking)
+        self.packed_text_indexes = self.packed_text_indexes.to(device, non_blocking=non_blocking)
+        self.packed_position_ids = self.packed_position_ids.to(device, non_blocking=non_blocking)
 
         if not self.use_flex:
-            self.nested_attention_masks = [item.to(device) for item in self.nested_attention_masks]
+            self.nested_attention_masks = [item.to(device, non_blocking=non_blocking) for item in self.nested_attention_masks]
 
-        if hasattr(self, 'padded_images'):
-            self.padded_images = self.padded_images.to(device)
-            self.packed_vae_token_indexes = self.packed_vae_token_indexes.to(device)
-            self.packed_latent_position_ids = self.packed_latent_position_ids.to(device)
+        if hasattr(self, 'packed_dino_image_tensor_list'):
+            self.packed_dino_token_indexes = self.packed_dino_token_indexes.to(device, non_blocking=non_blocking)
+            self.dino_token_seqlens = self.dino_token_seqlens.to(device, non_blocking=non_blocking)
 
-        if hasattr(self, 'packed_timesteps'):
-            self.packed_timesteps = self.packed_timesteps.to(device)
-            self.mse_loss_indexes = self.mse_loss_indexes.to(device)
+            self.packed_depths =  self.packed_depths.to(device, non_blocking=non_blocking)
+            self.packed_extrinsics =  self.packed_extrinsics.to(device, non_blocking=non_blocking)
+            self.packed_intrinsics =  self.packed_intrinsics.to(device, non_blocking=non_blocking)
+            self.packed_world_points =  self.packed_world_points.to(device, non_blocking=non_blocking)
+            self.packed_point_masks = self.packed_point_masks.to(device, non_blocking=non_blocking)
+            self.packed_dino_image_tensor_list = self.packed_dino_image_tensor_list.to(device, non_blocking=non_blocking)
 
-        if hasattr(self, 'packed_vit_tokens'):
-            self.packed_vit_tokens = self.packed_vit_tokens.to(device)
-            self.packed_vit_position_ids = self.packed_vit_position_ids.to(device)
-            self.packed_vit_token_indexes = self.packed_vit_token_indexes.to(device)
-            self.vit_token_seqlens = self.vit_token_seqlens.to(device)
+        if hasattr(self, 'packed_vit_images'):
+            self.packed_vit_images = self.packed_vit_images.to(device, non_blocking=non_blocking)
+            self.packed_image_grid_thw = self.packed_image_grid_thw.to(device, non_blocking=non_blocking)
+            self.packed_vit_token_indexes = self.packed_vit_token_indexes.to(device, non_blocking=non_blocking)
+            self.vit_token_seqlens = self.vit_token_seqlens.to(device, non_blocking=non_blocking)
 
         if hasattr(self, 'packed_label_ids'):
-            self.packed_label_ids = self.packed_label_ids.to(device)
-            self.ce_loss_indexes = self.ce_loss_indexes.to(device)
-            self.ce_loss_weights = self.ce_loss_weights.to(device)
+            self.packed_label_ids = self.packed_label_ids.to(device, non_blocking=non_blocking)
+            self.ce_loss_indexes = self.ce_loss_indexes.to(device, non_blocking=non_blocking)
+            self.ce_loss_weights = self.ce_loss_weights.to(device, non_blocking=non_blocking)
 
         return self
 
@@ -590,21 +790,25 @@ class SimpleCustomBatch:
             data['split_lens'] = self.split_lens
             data['attn_modes'] = self.attn_modes
 
-        if hasattr(self, 'padded_images'):
-            data['padded_images'] = self.padded_images
-            data['patchified_vae_latent_shapes'] = self.patchified_vae_latent_shapes
-            data['packed_latent_position_ids'] = self.packed_latent_position_ids
-            data['packed_vae_token_indexes'] = self.packed_vae_token_indexes
+        if hasattr(self, 'packed_dino_image_tensor_list'):
+            data['packed_dino_token_indexes'] = self.packed_dino_token_indexes
+            data['dino_token_seqlens'] = self.dino_token_seqlens
 
-        if hasattr(self, 'packed_vit_tokens'):
-            data['packed_vit_tokens'] = self.packed_vit_tokens
-            data['packed_vit_position_ids'] = self.packed_vit_position_ids
+            data['packed_depths'] =  self.packed_depths  
+            data['packed_extrinsics'] = self.packed_extrinsics
+            data['packed_intrinsics'] = self.packed_intrinsics 
+            data['packed_world_points'] = self.packed_world_points 
+            data['packed_point_masks'] = self.packed_point_masks
+            data['packed_dino_image_tensor_list'] = self.packed_dino_image_tensor_list
+            data['img_per_seq_lens'] = self.img_per_seq_lens
+            data['packed_view_infos'] = self.packed_view_infos
+            data['packed_image_paths'] = self.packed_image_paths
+
+        if hasattr(self, 'packed_vit_images'):
+            data['packed_vit_images'] = self.packed_vit_images
+            data['packed_image_grid_thw'] = self.packed_image_grid_thw
             data['packed_vit_token_indexes'] = self.packed_vit_token_indexes
             data['vit_token_seqlens'] = self.vit_token_seqlens
-
-        if hasattr(self, 'packed_timesteps'):
-            data['packed_timesteps'] = self.packed_timesteps
-            data['mse_loss_indexes'] = self.mse_loss_indexes
 
         if hasattr(self, 'packed_label_ids'):
             data['packed_label_ids'] = self.packed_label_ids

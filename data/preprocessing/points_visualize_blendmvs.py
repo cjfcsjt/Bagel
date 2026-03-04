@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
 import os.path as osp
-import re 
+import re
+import json
 from tqdm import tqdm 
 import numpy as np
 
@@ -141,6 +142,90 @@ def _crop_image(intrinsics_in, color_image_in, depthmap_in, resolution_out=(800,
     R_in2out = np.eye(3) # 无旋转变换
     return image, depthmap, intrinsics_out, R_in2out
 
+
+def save_scene_annotation(out_dir, scene_name):
+    """
+    为一个场景保存标注NPZ文件，包含所有视图的3D meta信息。
+    文件按照排序后的图像名索引，使得可以通过 idx 直接访问。
+
+    保存内容:
+        - img_names: 排序后的图像名称列表 (N,)
+        - intrinsics: 所有视图的内参矩阵 (N, 3, 3)
+        - R_cam2world: 所有视图的cam2world旋转矩阵 (N, 3, 3)
+        - t_cam2world: 所有视图的cam2world平移向量 (N, 3)
+        - depth_files: 所有视图的深度图文件名 (N,)
+        - rgb_files: 所有视图的RGB图像文件名 (N,)
+
+    使用方式:
+        data = np.load("scene_annotation.npz", allow_pickle=True)
+        idx = 5
+        K = data["intrinsics"][idx]          # (3, 3) 内参矩阵
+        R = data["R_cam2world"][idx]          # (3, 3) 旋转矩阵
+        t = data["t_cam2world"][idx]          # (3,) 平移向量
+        rgb_file = str(data["rgb_files"][idx])  # RGB图像文件名
+        depth_file = str(data["depth_files"][idx])  # 深度图文件名
+
+    Args:
+        out_dir: 处理后数据的输出目录 (包含 .jpg, .exr, .npz 文件)
+        scene_name: 场景名称
+
+    Returns:
+        num_images: 该场景中的图像总数
+    """
+    # 找到所有已处理的 per-view .npz 文件（排除 scene_annotation.npz 本身）
+    all_npz = sorted([
+        f[:-4] for f in os.listdir(out_dir)
+        if f.endswith(".npz") and f != "scene_annotation.npz"
+    ])
+
+    if len(all_npz) == 0:
+        print(f"  [warn] no processed views found in {out_dir}")
+        return 0
+
+    # 收集所有视图的meta信息
+    intrinsics_list = []
+    R_cam2world_list = []
+    t_cam2world_list = []
+    rgb_files_list = []
+    depth_files_list = []
+    valid_img_names = []
+
+    for img_name in all_npz:
+        npz_path = osp.join(out_dir, img_name + ".npz")
+        rgb_path = osp.join(out_dir, img_name + ".jpg")
+        depth_path = osp.join(out_dir, img_name + ".exr")
+
+        # 确保三件套都存在
+        if not (osp.exists(npz_path) and osp.exists(rgb_path) and osp.exists(depth_path)):
+            continue
+
+        cam_params = np.load(npz_path)
+        intrinsics_list.append(cam_params["intrinsics"])
+        R_cam2world_list.append(cam_params["R_cam2world"])
+        t_cam2world_list.append(cam_params["t_cam2world"])
+        rgb_files_list.append(img_name + ".jpg")
+        depth_files_list.append(img_name + ".exr")
+        valid_img_names.append(img_name)
+
+    if len(valid_img_names) == 0:
+        print(f"  [warn] no complete views found in {out_dir}")
+        return 0
+
+    # 保存标注NPZ
+    np.savez(
+        osp.join(out_dir, "scene_annotation.npz"),
+        img_names=np.array(valid_img_names),              # (N,)
+        intrinsics=np.stack(intrinsics_list, axis=0),      # (N, 3, 3)
+        R_cam2world=np.stack(R_cam2world_list, axis=0),    # (N, 3, 3)
+        t_cam2world=np.stack(t_cam2world_list, axis=0),    # (N, 3)
+        rgb_files=np.array(rgb_files_list),                # (N,)
+        depth_files=np.array(depth_files_list),            # (N,)
+    )
+
+    print(f"  saved scene_annotation.npz with {len(valid_img_names)} views")
+    return len(valid_img_names)
+
+
 def generate_3d_visualization(root, out_dir, scene_name, num_views=10):
     """
     为指定场景生成 3D 点云可视化
@@ -257,6 +342,10 @@ def main(db_root, output_dir):
     assert sequences, f"found {len(sequences)} sequences in {db_root}"
     print(f"found {len(sequences)} sequences in {db_root}")
 
+    # JSONL文件路径
+    jsonl_path = osp.join(output_dir, "blendmvs_scenes.jsonl")
+    jsonl_entries = []
+
     for i, seq in enumerate(tqdm(sequences)):
         out_dir = osp.join(output_dir, seq)
         os.makedirs(out_dir, exist_ok=True)
@@ -273,11 +362,32 @@ def main(db_root, output_dir):
         # 多进程处理，对func_args中的每个三元组，调用load_crop_and_save函数
         parallel_threads(load_crop_and_save, func_args, star_args=True, leave=False)
 
+        # 保存场景标注NPZ（汇总所有视图的meta信息，方便通过idx访问）
+        num_images = save_scene_annotation(out_dir, seq)
+
+        # 收集JSONL条目
+        jsonl_entries.append({
+            "scene_name": "blendmvs",
+            "seq_name": seq,
+            "num_images": num_images,
+            "img_dir": osp.abspath(out_dir),
+        })
+
         # 如果指定了可视化场景，那么可视化场景
         generate_3d_visualization(root, out_dir, seq, num_views=10)
 
+    # 保存JSONL文件
+    with open(jsonl_path, "w") as f:
+        for entry in jsonl_entries:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    print(f"\n{'='*60}")
+    print(f"JSONL index saved to: {osp.abspath(jsonl_path)}")
+    print(f"Total scenes: {len(jsonl_entries)}")
+    print(f"{'='*60}")
+
 if __name__ == "__main__":
-    main("/apdcephfs_303747097/share_303747097/jingfanchen/data/blendmvs/download", "/apdcephfs_303747097/share_303747097/jingfanchen/data/blendmvs/processed")
+    main("/data/spatial_data/data/blendedmvs", "/data/spatial_data/data/blendedmvs/processed")
 
 
 

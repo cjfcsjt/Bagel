@@ -10,7 +10,26 @@ import torch
 from torchvision import transforms
 from torchvision.transforms import functional as F
 from torchvision.transforms import InterpolationMode
+from transformers.image_transforms import (
+    convert_to_rgb,
+    resize,
+    to_channel_dimension_format,
+)
+from transformers.image_utils import (
+    OPENAI_CLIP_MEAN,
+    OPENAI_CLIP_STD,
+    ChannelDimension,
+    ImageInput,
+    PILImageResampling,
+    infer_channel_dimension_format,
+    is_scaled_image,
+    make_flat_list_of_images,
+    to_numpy_array,
+    valid_images,
+    validate_preprocess_arguments,
+)
 
+from modeling.qwen2vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
 
 class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
     """Resize the input image so that its longest side and shortest side are within a specified range,
@@ -86,7 +105,78 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
 
         return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
 
+_RESNET_MEAN = [0.485, 0.456, 0.406]
+_RESNET_STD = [0.229, 0.224, 0.225]
 
+class InternVLImageTransform:
+    def __init__(
+        self, 
+        max_image_size, 
+        min_image_size, 
+        image_stride, 
+        max_pixels=14*14*9*1024,
+        image_mean=OPENAI_CLIP_MEAN, 
+        image_std=OPENAI_CLIP_STD,
+    ):
+        self.stride = image_stride
+
+        self.to_tensor_transform = transforms.ToTensor()
+        self.normalize_transform = transforms.Normalize(mean=image_mean, std=image_std, inplace=True)
+
+    def __call__(self, img, img_num=1):
+    
+        image = convert_to_rgb(img)
+        image = to_numpy_array(image)
+        image = resize(
+            image,
+            size=(448, 448),
+            resample=3
+        )
+        # image = self.rescale(image=image, scale= 0.00392156862745098, input_data_format=input_data_format)
+        # image = self.normalize(
+        #         image=image,
+        #         mean=image_mean,
+        #         std=image_std,
+        #         input_data_format=input_data_format,
+        #     )
+        # return image
+        # img = img.permute(2, 0, 1)  
+        # print('image numpy', image.shape)
+        img = self.to_tensor_transform(image)
+        # img = img.permute(2, 0, 1)  
+        # print('img', img.shape)
+        img = self.normalize_transform(img)
+        return img
+    
+class QwenVL2ImageTransform:
+    def __init__(
+        self, 
+        image_size_h, 
+        image_size_w, 
+        image_stride=14, 
+        max_pixels=14*14*9*1024,
+        image_mean=OPENAI_CLIP_MEAN, 
+        image_std=OPENAI_CLIP_STD,
+    ):
+        self.processor = Qwen2VLImageProcessor.from_pretrained('InternRobotics/G2VLM-2B-MoT')
+        self.img_h = image_size_h
+        self.img_w = image_size_w
+        self.stride = image_stride
+
+        # self.to_tensor_transform = transforms.ToTensor()
+        # self.normalize_transform = transforms.Normalize(mean=image_mean, std=image_std, inplace=True)
+
+    def __call__(self, img, img_num=1):
+        # if self.img_h is not None:
+        target_size = (self.img_h, self.img_w )
+        img = [ii.resize(target_size,3) for ii in img]
+
+        out = self.processor(img, return_tensors='pt')
+        pixel_values =  out['pixel_values'] # this is flattened. 
+        image_grid_thw =  out['image_grid_thw']
+
+        return pixel_values,  image_grid_thw
+        
 class ImageTransform:
     def __init__(
         self, 

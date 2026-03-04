@@ -1,6 +1,3 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
-
 import pyarrow.parquet as pq
 
 from ..distributed_iterable_dataset import DistributedIterableDataset
@@ -127,7 +124,6 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
                 data['num_tokens'] += width * height // self.transform.stride ** 2
 
         return data
-
 
 class ParquetStandardIterableDataset(DistributedIterableDataset):
 
