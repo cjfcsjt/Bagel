@@ -5,7 +5,7 @@
 from .g2vlm import G2VLMConfig, G2VLM
 from .qwen2vl import Qwen2VLConfig, Qwen2VLModel, Qwen2VLForCausalLM
 from .dinov2_model import Dinov2WithRegistersConfig, Dinov2WithRegistersModel
-
+from .ssl_decoder import SSLDecoder
 
 __all__ = [
     'G2VLMConfig',

@@ -28,6 +28,7 @@ from modeling.qwen2vl.modeling_qwen2_vl import (
     Qwen2RMSNorm, 
     Qwen2VLRotaryEmbedding,
     apply_multimodal_rotary_pos_emb,
+    repeat_kv
 )
 from modeling.qwen2vl.configuration_qwen2_vl import Qwen2VLConfig as _Qwen2VLConfig
 from modeling.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
@@ -41,7 +42,22 @@ class LayerScale(nn.Module):
     def __init__(self, dim: int, init_values: Union[float, Tensor] = 1e-5, inplace: bool = False) -> None:
         super().__init__()
         self.inplace = inplace
-        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+        # 先创建 tensor 并检查
+        gamma_tensor = init_values * torch.ones(dim)
+        print(f"[LayerScale __init__] Creating gamma with init_values={init_values}, dim={dim}")
+        print(f"[LayerScale __init__] gamma_tensor device: {gamma_tensor.device}, is_meta: {gamma_tensor.is_meta}")
+        
+        # 包装成 Parameter
+        self.gamma = nn.Parameter(gamma_tensor)
+        
+        # 检查包装后的值
+        print(f"[LayerScale __init__] AFTER nn.Parameter - gamma device: {self.gamma.device}, is_meta: {self.gamma.is_meta}")
+        if not self.gamma.is_meta:
+            print(f"  min={self.gamma.min().item():.6e}, max={self.gamma.max().item():.6e}, mean={self.gamma.mean().item():.6e}")
+            print(f"  has_nan={torch.isnan(self.gamma).any().item()}, has_inf={torch.isinf(self.gamma).any().item()}")
+            print(f"  First 5: {self.gamma.data[:5].tolist()}")
+        else:
+            print(f"  gamma is on meta device - skipping value checks")
 
     def forward(self, x: Tensor) -> Tensor:
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
@@ -435,6 +451,22 @@ class PackedAttentionMoT(Qwen2VLAttention):
         self.k_proj_moe_geo = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj_moe_geo = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj_moe_geo = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        
+        # For storing Q/K states to compute attention maps externally
+        self._save_qk_states = False
+        self._saved_query_states = None
+        self._saved_key_states = None
+
+    def enable_qk_saving(self, enable: bool = True):
+        """Enable or disable saving Q/K states for attention map computation."""
+        self._save_qk_states = enable
+        if not enable:
+            self._saved_query_states = None
+            self._saved_key_states = None
+
+    def get_saved_qk_states(self):
+        """Get the saved Q/K states."""
+        return self._saved_query_states, self._saved_key_states
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -451,6 +483,17 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_und_token_indexes: torch.LongTensor,
         packed_geo_token_indexes: torch.LongTensor,
     ):
+        def _check_nan_inf(tensor, name):
+            has_nan = torch.isnan(tensor).any().item()
+            has_inf = torch.isinf(tensor).any().item()
+            if has_nan or has_inf:
+                print(f"    [Attn NaN/Inf] {name}: NaN={has_nan}, Inf={has_inf}, min={tensor.min():.6e}, max={tensor.max():.6e}")
+                return True
+            return False
+
+        # === 检查输入 ===
+        _check_nan_inf(packed_sequence, "Input packed_sequence")
+
         packed_query_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_heads * self.head_dim))
         packed_key_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
         packed_value_states = packed_sequence.new_zeros((packed_sequence.shape[0], self.num_key_value_heads * self.head_dim))
@@ -461,11 +504,23 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_query_states[packed_und_token_indexes] = self.q_proj(packed_sequence_und)
         packed_query_states[packed_geo_token_indexes] = self.q_proj_moe_geo(packed_sequence_gen)
 
+        # === 检查 Q projection ===
+        _check_nan_inf(packed_query_states[packed_und_token_indexes], "After q_proj (und)")
+        _check_nan_inf(packed_query_states[packed_geo_token_indexes], "After q_proj_moe_geo (geo)")
+
         packed_key_states[packed_und_token_indexes] = self.k_proj(packed_sequence_und)
         packed_key_states[packed_geo_token_indexes] = self.k_proj_moe_geo(packed_sequence_gen)
 
+        # === 检查 K projection ===
+        _check_nan_inf(packed_key_states[packed_und_token_indexes], "After k_proj (und)")
+        _check_nan_inf(packed_key_states[packed_geo_token_indexes], "After k_proj_moe_geo (geo)")
+
         packed_value_states[packed_und_token_indexes] = self.v_proj(packed_sequence_und)
         packed_value_states[packed_geo_token_indexes] = self.v_proj_moe_geo(packed_sequence_gen)
+
+        # === 检查 V projection ===
+        _check_nan_inf(packed_value_states[packed_und_token_indexes], "After v_proj (und)")
+        _check_nan_inf(packed_value_states[packed_geo_token_indexes], "After v_proj_moe_geo (geo)")
 
         packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
         packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -486,6 +541,10 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_query_states_[packed_geo_token_indexes] = self.q_norm_moe_geo(packed_query_states[packed_geo_token_indexes])
         if self.config.freeze_recon:
             packed_query_states_[packed_geo_token_indexes] = packed_query_states_[packed_geo_token_indexes].detach()
+
+        # === 检查 Q norm ===
+        _check_nan_inf(packed_query_states_[packed_und_token_indexes], "After q_norm (und)")
+        _check_nan_inf(packed_query_states_[packed_geo_token_indexes], "After q_norm_moe_geo (geo)")
         
         
         packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes])
@@ -495,7 +554,16 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_key_states_[packed_geo_token_indexes] = self.k_norm_moe_geo(packed_key_states[packed_geo_token_indexes])
         if self.config.freeze_recon:
             packed_key_states_[packed_geo_token_indexes] = packed_key_states_[packed_geo_token_indexes].detach()
+
+        # === 检查 K norm ===
+        _check_nan_inf(packed_key_states_[packed_und_token_indexes], "After k_norm (und)")
+        _check_nan_inf(packed_key_states_[packed_geo_token_indexes], "After k_norm_moe_geo (geo)")
+
         packed_cos, packed_sin = packed_position_embeddings
+
+        # === 检查 RoPE embeddings ===
+        _check_nan_inf(packed_cos, "packed_cos (RoPE)")
+        _check_nan_inf(packed_sin, "packed_sin (RoPE)")
 
         #for multimodal rotrary pos embed 
         packed_query_states_ = packed_query_states_.transpose(0,1)
@@ -504,6 +572,11 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_query_states_, packed_key_states_ = apply_multimodal_rotary_pos_emb(
             packed_query_states_, packed_key_states_, packed_cos, packed_sin, self.rope_scaling["mrope_section"], unsqueeze_dim=1
         )
+
+        # === 检查 RoPE 后 ===
+        _check_nan_inf(packed_query_states_, "After RoPE (query)")
+        _check_nan_inf(packed_key_states_, "After RoPE (key)")
+
         # transpose back 
         packed_query_states_ = packed_query_states_.transpose(0,1)
         packed_key_states_ = packed_key_states_.transpose(0,1)
@@ -518,9 +591,19 @@ class PackedAttentionMoT(Qwen2VLAttention):
             unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
             unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
             upacked_attn_output = []
-            for query_states, key_states, value_states, attention_mask_per_sample in zip(
+            for idx_sample, (query_states, key_states, value_states, attention_mask_per_sample) in enumerate(zip(
                 unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
-            ):
+            )):
+                # === 检查每个 sample 的 attention 输入 ===
+                if _check_nan_inf(query_states, f"Sample {idx_sample} query_states before SDPA"):
+                    pass
+                if _check_nan_inf(key_states, f"Sample {idx_sample} key_states before SDPA"):
+                    pass
+                if _check_nan_inf(value_states, f"Sample {idx_sample} value_states before SDPA"):
+                    pass
+                if _check_nan_inf(attention_mask_per_sample, f"Sample {idx_sample} attention_mask before SDPA"):
+                    pass
+
                 with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
                     attn_output = scaled_dot_product_attention(
                         query_states.to(torch.bfloat16).unsqueeze(0), 
@@ -528,6 +611,10 @@ class PackedAttentionMoT(Qwen2VLAttention):
                         value_states.to(torch.bfloat16).unsqueeze(0),
                         attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
                     )
+                
+                # === 检查 SDPA 输出 ===
+                _check_nan_inf(attn_output, f"Sample {idx_sample} attn_output after SDPA")
+
                 upacked_attn_output.append(attn_output.squeeze(0))
             packed_attn_output = torch.cat(upacked_attn_output, dim=1)
         else:
@@ -535,6 +622,12 @@ class PackedAttentionMoT(Qwen2VLAttention):
             packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
             packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
             packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
+
+            # === 检查 flex_attention 输入 ===
+            _check_nan_inf(packed_query_states_, "query before flex_attention")
+            _check_nan_inf(packed_key_states_, "key before flex_attention")
+            _check_nan_inf(packed_value_states, "value before flex_attention")
+
             packed_attn_output = flex_attention(
                 packed_query_states_.unsqueeze(0), 
                 packed_key_states_.unsqueeze(0), 
@@ -542,13 +635,24 @@ class PackedAttentionMoT(Qwen2VLAttention):
                 enable_gqa=True,
                 block_mask=attention_mask,
             )
+
+            # === 检查 flex_attention 输出 ===
+            _check_nan_inf(packed_attn_output, "attn_output after flex_attention")
+
             end_index = packed_attn_output.shape[2] - pad_size
             packed_attn_output = packed_attn_output[0, :, :end_index, :]
+
+        # === 检查 attention 输出 ===
+        _check_nan_inf(packed_attn_output, "packed_attn_output before o_proj")
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
         packed_attn_output_[packed_und_token_indexes] = self.o_proj(packed_attn_output[packed_und_token_indexes])
         packed_attn_output_[packed_geo_token_indexes] = self.o_proj_moe_geo(packed_attn_output[packed_geo_token_indexes])
+
+        # === 检查 o_proj 输出 ===
+        _check_nan_inf(packed_attn_output_[packed_und_token_indexes], "After o_proj (und)")
+        _check_nan_inf(packed_attn_output_[packed_geo_token_indexes], "After o_proj_moe_geo (geo)")
 
         return packed_attn_output_
 
@@ -632,6 +736,27 @@ class PackedAttentionMoT(Qwen2VLAttention):
             merged_value_states[packed_query_indexes] = packed_value_states
             merged_value_states[packed_key_value_indexes] = past_value_states
             key_values_lens = key_values_lens + query_lens
+            # Save Q/K states for attention map computation if enabled
+            # Only save geo (dino) token Q/K for cross-view attention
+            if self._save_qk_states and packed_geo_token_indexes is not None:
+                # Get geo tokens directly from packed_query_states and packed_key_states
+                # Q shape: (num_geo_tokens, num_heads, head_dim)
+                geo_q = packed_query_states[packed_geo_token_indexes].clone()
+                # K shape: (num_geo_tokens, num_key_value_heads, head_dim)
+                geo_k = packed_key_states[packed_geo_token_indexes].clone()
+                
+                # Handle GQA: expand K to match Q's num_heads using repeat_kv
+                # repeat_kv expects (batch, num_key_value_heads, seqlen, head_dim)
+                # geo_k: (num_geo_tokens, num_key_value_heads, head_dim) 
+                #     -> (1, num_key_value_heads, num_geo_tokens, head_dim) for repeat_kv
+                #     -> (1, num_heads, num_geo_tokens, head_dim) after repeat_kv
+                #     -> (num_geo_tokens, num_heads, head_dim)
+                geo_k = geo_k.permute(1, 0, 2).unsqueeze(0)  # (1, num_key_value_heads, num_geo_tokens, head_dim)
+                geo_k = repeat_kv(geo_k, self.num_key_value_groups)  # (1, num_heads, num_geo_tokens, head_dim)
+                geo_k = geo_k.squeeze(0).permute(1, 0, 2)  # (num_geo_tokens, num_heads, head_dim)
+                
+                self._saved_query_states = geo_q  # (num_geo_tokens, num_heads, head_dim)
+                self._saved_key_states = geo_k    # (num_geo_tokens, num_heads, head_dim)
         else:
             merged_key_states = packed_key_states
             merged_value_states = packed_value_states
@@ -640,10 +765,10 @@ class PackedAttentionMoT(Qwen2VLAttention):
         cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
         cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
 
-        packed_attn_output = flash_attn_varlen_func(
-            q=packed_query_states,
-            k=merged_key_states,
-            v=merged_value_states,
+        packed_attn_output = flash_attn_varlen_func( # Flash Attention 内部会自动处理 GQA，它知道如何让多个 Q heads 共享同一个 K/V head，所以不需要显式扩展 K/V。
+            q=packed_query_states, # (seq_len, num_heads, head_dim)
+            k=merged_key_states, # (seq_len, num_key_value_heads, head_dim)  ← 不同！
+            v=merged_value_states, # (seq_len, num_key_value_heads, head_dim)  ← 不同！
             cu_seqlens_q=cu_seqlens_q.to(torch.int32),
             cu_seqlens_k=cu_seqlens_k.to(torch.int32),
             max_seqlen_q=max(query_lens).item(),
@@ -760,7 +885,7 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
         self.freeze_und = config.freeze_und
         self.freeze_recon = config.freeze_recon
 
-        self.layer_scale = True
+        self.layer_scale = config.layer_scale
         if self.layer_scale:
             self.ls1 = LayerScale(config.hidden_size, init_values=0.01)
             self.ls2 = LayerScale(config.hidden_size, init_values=0.01) 
@@ -790,10 +915,25 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
         packed_geo_token_indexes: torch.LongTensor,
     ) -> torch.Tensor:
 
+        def _check_nan_inf(tensor, name):
+            has_nan = torch.isnan(tensor).any().item()
+            has_inf = torch.isinf(tensor).any().item()
+            if has_nan or has_inf:
+                print(f"  [NaN/Inf] {name}: NaN={has_nan}, Inf={has_inf}, min={tensor.min():.6e}, max={tensor.max():.6e}")
+                return True
+            return False
+
+        # === 检查输入 ===
+        _check_nan_inf(packed_sequence, "Input packed_sequence")
+
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
         packed_sequence_[packed_und_token_indexes] = self.input_layernorm(packed_sequence[packed_und_token_indexes])
         packed_sequence_[packed_geo_token_indexes] = self.input_layernorm_moe_geo(packed_sequence[packed_geo_token_indexes])
+
+        # === 检查 LayerNorm 后 ===
+        _check_nan_inf(packed_sequence_[packed_und_token_indexes], "After input_layernorm (und)")
+        _check_nan_inf(packed_sequence_[packed_geo_token_indexes], "After input_layernorm_moe_geo (geo)")
 
         # Self Attention
         packed_sequence_ = self.self_attn(
@@ -804,38 +944,69 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
             packed_und_token_indexes=packed_und_token_indexes,
             packed_geo_token_indexes=packed_geo_token_indexes,
         )
+
+        # === 检查 Self Attention 后 ===
+        _check_nan_inf(packed_sequence_[packed_und_token_indexes], "After self_attn (und)")
+        _check_nan_inf(packed_sequence_[packed_geo_token_indexes], "After self_attn (geo)")
+
         if self.freeze_und:
             packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
         if self.freeze_recon:
             packed_sequence_[packed_geo_token_indexes] = packed_sequence_[packed_geo_token_indexes].detach()
         
         if self.layer_scale:
+            before = packed_sequence_[packed_geo_token_indexes]
+            print(f"\n=== LayerScale Debug ===")
+            print(f"Before ls1 - min={before.min():.6e}, max={before.max():.6e}, mean={before.mean():.6e}")
+            print(f"Before ls1 - has_nan={torch.isnan(before).any()}, has_inf={torch.isinf(before).any()}")
+            print(f"gamma - min={self.ls1.gamma.min():.6e}, max={self.ls1.gamma.max():.6e}")
+            print(f"gamma - has_nan={torch.isnan(self.ls1.gamma).any()}, has_inf={torch.isinf(self.ls1.gamma).any()}")
+            print(f"gamma - dtype={self.ls1.gamma.dtype}, requires_grad={self.ls1.gamma.requires_grad}")
+            
             packed_sequence_[packed_geo_token_indexes] = self.ls1(packed_sequence_[packed_geo_token_indexes])
+            
+            after = packed_sequence_[packed_geo_token_indexes]
+            print(f"After ls1 - min={after.min():.6e}, max={after.max():.6e}, mean={after.mean():.6e}")
+            print(f"After ls1 - has_nan={torch.isnan(after).any()}, has_inf={torch.isinf(after).any()}")
+            print(f"======================\n")
        
         packed_sequence = residual + packed_sequence_
+
+        # === 检查第一个残差连接后 ===
+        _check_nan_inf(packed_sequence, "After first residual connection")
 
         # Fully Connected
         residual = packed_sequence
         packed_sequence_ = packed_sequence.new_zeros(packed_sequence.shape)
-        packed_sequence_[packed_und_token_indexes] = self.mlp(
-            self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
-        )
+
+        # === 检查 post_attention_layernorm ===
+        post_ln_und = self.post_attention_layernorm(packed_sequence[packed_und_token_indexes])
+        _check_nan_inf(post_ln_und, "After post_attention_layernorm (und)")
+        packed_sequence_[packed_und_token_indexes] = self.mlp(post_ln_und)
+        _check_nan_inf(packed_sequence_[packed_und_token_indexes], "After mlp (und)")
+
         if self.freeze_und:
             packed_sequence_[packed_und_token_indexes] = packed_sequence_[packed_und_token_indexes].detach()
-    
-        packed_sequence_[packed_geo_token_indexes] = self.mlp_moe_geo(
-            self.post_attention_layernorm_moe_geo(packed_sequence[packed_geo_token_indexes])
-        )
+
+        post_ln_geo = self.post_attention_layernorm_moe_geo(packed_sequence[packed_geo_token_indexes])
+        _check_nan_inf(post_ln_geo, "After post_attention_layernorm_moe_geo (geo)")
+        packed_sequence_[packed_geo_token_indexes] = self.mlp_moe_geo(post_ln_geo)
+        _check_nan_inf(packed_sequence_[packed_geo_token_indexes], "After mlp_moe_geo (geo)")
+
         if self.freeze_recon:
             packed_sequence_[packed_geo_token_indexes] = packed_sequence_[packed_geo_token_indexes].detach()
 
         if self.layer_scale:
             packed_sequence_[packed_geo_token_indexes] = self.ls2(packed_sequence_[packed_geo_token_indexes])
+            _check_nan_inf(packed_sequence_[packed_geo_token_indexes], "After ls2 (geo)")
         if self.freeze_recon:
             packed_sequence_[packed_geo_token_indexes] = packed_sequence_[packed_geo_token_indexes].detach()
 
         
         packed_sequence = residual + packed_sequence_
+
+        # === 检查最终输出 ===
+        _check_nan_inf(packed_sequence, "Final output (after second residual)")
 
         return packed_sequence
 
@@ -1244,9 +1415,18 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 **extra_inputs
             )
 
+            # === NaN/Inf 检测 ===
+            has_nan = torch.isnan(packed_sequence).any().item()
+            has_inf = torch.isinf(packed_sequence).any().item()
+            if has_nan or has_inf:
+                print(f"[Layer {idx_l}] NaN={has_nan}, Inf={has_inf}, "
+                      f"min={packed_sequence.min().item():.6e}, max={packed_sequence.max().item():.6e}, "
+                      f"mean={packed_sequence.mean().item():.6e}, std={packed_sequence.std().item():.6e}")
+            # ====================
+
             if output_hidden_states:
-                if idx_l in intermediate_layers:
-                    all_hidden_states += (packed_sequence, )
+                # if idx_l in intermediate_layers:
+                all_hidden_states += (packed_sequence, )
 
         if self.use_moe:
             packed_sequence_ = torch.zeros_like(packed_sequence)
@@ -1316,8 +1496,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
                 **extra_inputs,
             )
             if output_hidden_states:
-                if idx_l in intermediate_layers:
-                    all_hidden_states += (packed_query_sequence, ) 
+                # if idx_l in intermediate_layers:
+                all_hidden_states += (packed_query_sequence, ) 
 
         if self.use_moe:
             if mode == "und":
