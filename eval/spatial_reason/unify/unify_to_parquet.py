@@ -9,6 +9,7 @@ Supported datasets
 2. **MindCube**    – JSONL benchmark (image-only, no depth/pose)
 3. **OmniSpatial** – JSON benchmark  (image-only, no depth/pose)
 4. **OST-Bench**   – JSON (LLaVA interleaved or plain eval format, image-only)
+5. **SenseNova-SI** – JSONL (832K spatial intelligence samples, image-only)
 
 Target Parquet row schema (matches ``parse_row`` in ``interleave_t2i_dataset.py``):
     question        : string
@@ -16,6 +17,7 @@ Target Parquet row schema (matches ``parse_row`` in ``interleave_t2i_dataset.py`
     scene_name      : string   ('scannet', 'matterport3d', '3rscan', 'scannetpp',
                                  'structured3d', 'mindcube', 'omnispatial', 'ost')
     dataset_name    : string   (must contain 'spar' for depth/pose branch)
+                                 'sensenova_si'
     image_list      : list<string>          – absolute RGB image paths
     depth_list      : list<string>          – absolute depth map paths (empty for image-only)
     poses           : list<list<float64>>   – per-frame 4×4 extrinsics (16 floats each)
@@ -56,6 +58,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from tqdm import tqdm
@@ -72,6 +75,67 @@ from ost import OSTBenchDataset                # noqa: E402
 
 
 # ═════════════════════════════════════════════════════════════════════════
+#  Image statistics collector
+# ═════════════════════════════════════════════════════════════════════════
+
+class ImageStatsCollector:
+    """Collect per-sample image count distribution and large-sample examples."""
+
+    def __init__(self, name: str, large_threshold: int = 10, max_large_examples: int = 5):
+        self.name = name
+        self.large_threshold = large_threshold
+        self.max_large_examples = max_large_examples
+        self.count_distribution: Dict[int, int] = defaultdict(int)  # n_images -> count
+        self.large_examples: List[dict] = []  # collected cases with > threshold images
+        self.total_images = 0
+        self.total_samples = 0
+
+    def record(self, n_images: int, sample_info: Optional[dict] = None):
+        """Record one sample's image count."""
+        self.count_distribution[n_images] += 1
+        self.total_images += n_images
+        self.total_samples += 1
+        if n_images > self.large_threshold and len(self.large_examples) < self.max_large_examples:
+            self.large_examples.append({
+                "n_images": n_images,
+                "info": sample_info or {},
+            })
+
+    def print_summary(self):
+        """Print the collected statistics."""
+        print(f"\n{'='*60}")
+        print(f"  [{self.name}] Image count distribution summary")
+        print(f"{'='*60}")
+        print(f"  Total samples : {self.total_samples}")
+        print(f"  Total images  : {self.total_images}")
+        if self.total_samples > 0:
+            print(f"  Avg images/sample: {self.total_images / self.total_samples:.2f}")
+
+        # Print distribution sorted by image count
+        print(f"\n  {'n_images':>10}  {'count':>8}  {'percent':>8}")
+        print(f"  {'-'*10}  {'-'*8}  {'-'*8}")
+        for n in sorted(self.count_distribution.keys()):
+            cnt = self.count_distribution[n]
+            pct = cnt / self.total_samples * 100 if self.total_samples else 0
+            print(f"  {n:>10}  {cnt:>8}  {pct:>7.2f}%")
+
+        # Print large-sample examples
+        n_large = sum(v for k, v in self.count_distribution.items() if k > self.large_threshold)
+        print(f"\n  Samples with > {self.large_threshold} images: {n_large}")
+        if self.large_examples:
+            print(f"  Example cases (up to {self.max_large_examples}):")
+            for i, ex in enumerate(self.large_examples):
+                print(f"    [{i+1}] n_images={ex['n_images']}")
+                info = ex["info"]
+                for k, v in info.items():
+                    val_str = str(v)
+                    if len(val_str) > 200:
+                        val_str = val_str[:200] + "..."
+                    print(f"        {k}: {val_str}")
+        print(f"{'='*60}\n")
+
+
+# ═════════════════════════════════════════════════════════════════════════
 #  Arrow schema
 # ═════════════════════════════════════════════════════════════════════════
 
@@ -80,7 +144,7 @@ ARROW_SCHEMA = pa.schema([
     ("answer",          pa.string()),
     ("scene_name",      pa.string()),
     ("dataset_name",    pa.string()),
-    ("image_list",      pa.list_(pa.string())),
+    ("image_path",      pa.list_(pa.string())),
     ("depth_list",      pa.list_(pa.string())),
     ("poses",           pa.list_(pa.list_(pa.float64()))),   # N × 16
     ("intrinsic",       pa.list_(pa.float64())),             # 16
@@ -189,7 +253,7 @@ def _spar_item_to_row(data_item: dict, image_root: str, ds_name: str, need_3d_an
         "answer":          answer,
         "scene_name":      scene_name,
         "dataset_name":    f"spar_{ds_name}",
-        "image_list":      image_list,
+        "image_path":      image_list,
         "depth_list":      depth_list,
         "poses":           poses,
         "intrinsic":       intrinsic,
@@ -273,7 +337,7 @@ def _imageonly_item_to_row(item: dict) -> Optional[dict]:
         "answer":          item.get("answer", ""),
         "scene_name":      item.get("scene_name", ""),
         "dataset_name":    item.get("dataset_name", ""),
-        "image_list":      image_list,
+        "image_path":      image_list,
         "depth_list":      [],               # no depth for image-only
         "poses":           [_IDENTITY_4x4] * n_images,  # placeholder poses
         "intrinsic":       _IDENTITY_4x4,
@@ -427,10 +491,15 @@ def process_spar(json_path: str, writer: ParquetBufferedWriter, need_3d_annotati
 
     total_processed = 0
     total_skipped = 0
+    img_stats = ImageStatsCollector("SPAR")
 
     for ds_name, ds_meta in ds_collections.items():
-        annotation_path = os.path.join("/data/spatial_data/reason_data/SPAR-7M-RGBD", ds_meta["annotation"])
-        image_root = os.path.join("/data/spatial_data/reason_data/SPAR-7M-RGBD", ds_meta["root"])
+        # # Skip datasets with 'rxr' in their name
+        # if 'rxr' in ds_name:
+        #     print(f"\n  [SPAR/{ds_name}] skipped (contains 'rxr')")
+        #     continue
+        annotation_path = os.path.join("/apdcephfs_303747097/share_303747097/jingfanchen/code/benchmark/SPAR/", ds_meta["annotation"])
+        image_root = os.path.join("/apdcephfs_303747097/share_303747097/jingfanchen/code/benchmark/SPAR/", ds_meta["root"])
         repeat_time = ds_meta.get("repeat_time", 1)
 
         print(f"\n  [SPAR/{ds_name}] annotation={annotation_path}, root={image_root}, repeat={repeat_time}")
@@ -466,6 +535,21 @@ def process_spar(json_path: str, writer: ParquetBufferedWriter, need_3d_annotati
             if row is None:
                 skipped += 1
                 continue
+
+            # Record image count statistics
+            n_images = len(row["image_list"])
+            # Skip samples with more than 5 images
+            if n_images > 4:
+                skipped += 1
+                continue
+            img_stats.record(n_images, {
+                "dataset": ds_name,
+                "id": data_item.get("id", ""),
+                "type": data_item.get("type", ""),
+                "image_list": row["image_list"],
+                "question": row["question"][:200] if row["question"] else "",
+            })
+
             writer.add(row)
 
         n = len(lines)
@@ -474,9 +558,10 @@ def process_spar(json_path: str, writer: ParquetBufferedWriter, need_3d_annotati
         print(f"  [SPAR/{ds_name}] processed={n - skipped}, skipped={skipped}")
 
     print(f"[SPAR] total processed={total_processed}, total skipped={total_skipped}")
+    img_stats.print_summary()
 
 
-def _mindcube_item_to_row(data_item: dict, image_root: str, ds_name: str) -> Optional[dict]:
+def _mindcube_item_to_row(data_item: dict, image_root: str, ds_name: str, index: int = 0) -> Optional[dict]:
     """
     Convert a single MindCube annotation item into the target Parquet row schema.
 
@@ -530,11 +615,14 @@ def _mindcube_item_to_row(data_item: dict, image_root: str, ds_name: str) -> Opt
             meta[k] = v
 
     return {
+        "index":           index,
         "question":        question,
+        "input_prompt":    question,
         "answer":          answer,
         "scene_name":      "mindcube",
+        "category":        "among",
         "dataset_name":    f"mindcube_{ds_name}",
-        "image_list":      image_list,
+        "image_path":      image_list,
         "depth_list":      [],
         "poses":           [_IDENTITY_4x4] * n_images,
         "intrinsic":       _IDENTITY_4x4,
@@ -547,6 +635,8 @@ def process_mindcube(
     json_path: str,
     writer: ParquetBufferedWriter,
     mindcube_data_root: str = "/data/spatial_data/reason_data",
+    csv_output_path: Optional[str] = None,
+    hf_repo: Optional[str] = None,
 ):
     """
     Load MindCube mix JSON → rows.
@@ -573,8 +663,12 @@ def process_mindcube(
 
     total_processed = 0
     total_skipped = 0
+    img_stats = ImageStatsCollector("MindCube")
+    all_rows_for_csv: List[dict] = []  # Collect rows for CSV export
 
     for ds_name, ds_meta in ds_collections.items():
+        if ds_name != 'MindCube_train_ff_rsn':
+            continue
         annotation_path = os.path.join(mindcube_data_root, ds_meta["annotation"])
         image_root = os.path.join(mindcube_data_root, ds_meta["root"])
         repeat_time = ds_meta.get("repeat_time", 1)
@@ -607,12 +701,27 @@ def process_mindcube(
             data_items = data_items[: int(len(data_items) * repeat_time)]
 
         skipped = 0
+        global_idx = 0
+        data_items = data_items[:10]
         for data_item in tqdm(data_items, desc=f"  MindCube/{ds_name}"):
-            row = _mindcube_item_to_row(data_item, image_root, ds_name)
+            row = _mindcube_item_to_row(data_item, image_root, ds_name, index=global_idx)
+            global_idx += 1
             if row is None:
                 skipped += 1
                 continue
+
+            # Record image count statistics
+            n_images = len(row["image_path"])
+            img_stats.record(n_images, {
+                "dataset": ds_name,
+                "id": data_item.get("id", ""),
+                "type": data_item.get("type", ""),
+                "image_path": row["image_path"],
+                "question": row["question"][:200] if row["question"] else "",
+            })
+
             writer.add(row)
+            all_rows_for_csv.append(row)
 
         n = len(data_items)
         total_processed += n - skipped
@@ -620,6 +729,11 @@ def process_mindcube(
         print(f"  [MindCube/{ds_name}] processed={n - skipped}, skipped={skipped}")
 
     print(f"[MindCube] total processed={total_processed}, total skipped={total_skipped}")
+    img_stats.print_summary()
+
+    # ── Save to CSV and optionally upload to HuggingFace ──
+    if all_rows_for_csv:
+        _save_csv_and_upload_hf(all_rows_for_csv, csv_output_path, hf_repo, dataset_label="mindcube")
 
 
 def process_omnispatial(
@@ -659,6 +773,208 @@ def process_ost(
             continue
         writer.add(row)
     print(f"[OST-Bench] processed={len(ds)}, skipped={skipped}")
+
+
+def _sensenova_si_item_to_row(data_item: dict, image_root: str, task_type: str) -> Optional[dict]:
+    """
+    Convert a single SenseNova-SI-800K annotation line (JSON object) into
+    the target Parquet row schema.
+
+    Each line has:
+      - ``id``: int – unique identifier
+      - ``conversations``: [{from, value}, ...] – human/gpt turns
+      - ``image``: list[str] – relative image paths (e.g. 'images/000/025035.jpg')
+
+    The ``<image>`` placeholders in conversation text mark where images
+    are inserted; the number of placeholders matches len(image).
+    """
+    # ── resolve image paths ──
+    raw_images = data_item.get("image", [])
+    if isinstance(raw_images, str):
+        raw_images = [raw_images]
+    if not raw_images:
+        return None
+
+    image_list = [os.path.join(image_root, p) for p in raw_images]
+
+    # ── extract question / answer from conversations ──
+    convs = data_item.get("conversations", [])
+    question = ""
+    answer = ""
+    for turn in convs:
+        role = turn.get("from", "")
+        value = turn.get("value", "")
+        if role == "human":
+            question = value
+        elif role == "gpt":
+            answer = value
+
+    # ── metadata ──
+    if task_type == 'geo':
+        meta = {
+            "type": "sensenova_si",
+            "task": "geo",
+            "id": data_item.get("id", ""),
+        }
+    elif task_type == 'und':
+        meta = {
+            "type": "sensenova_si",
+            "task": "und",
+            "id": data_item.get("id", ""),
+        }
+    else:
+        raise ValueError(f"Unknown task type: {task_type}")
+
+    n_images = len(image_list)
+
+    return {
+        "question":        question,
+        "answer":          answer,
+        "scene_name":      "sensenova_si",
+        "dataset_name":    "sensenova_si",
+        "image_path":      image_list,
+        "depth_list":      [],
+        "poses":           [_IDENTITY_4x4] * n_images,
+        "intrinsic":       _IDENTITY_4x4,
+        "depth_intrinsic": _IDENTITY_4x4,
+        "metadata":        _ensure_metadata_str(meta),
+    }
+
+
+def process_sensenova_si(
+    jsonl_path: str,
+    image_root: str,
+    geo_writer: ParquetBufferedWriter,
+    und_writer: ParquetBufferedWriter,
+    max_images_per_sample: int = 8,
+):
+    """
+    Load SenseNova-SI-800K JSONL → rows.
+
+    Each sample is derived into **two** tasks (geo and und), written to
+    separate Parquet writers.
+
+    Args:
+        jsonl_path: Path to SenseNova-SI-800K.jsonl
+        image_root: Root directory for resolving relative image paths
+                    (the directory containing the 'images/' folder)
+        geo_writer: ParquetBufferedWriter for geo task
+        und_writer: ParquetBufferedWriter for und task
+        max_images_per_sample: Skip samples with more images than this
+    """
+    print(f"\n[SenseNova-SI] Loading {jsonl_path}")
+
+    # Count lines first for progress bar
+    with open(jsonl_path, "r") as f:
+        total_lines = sum(1 for _ in f)
+    print(f"  Total lines: {total_lines}")
+
+    img_stats = ImageStatsCollector("SenseNova-SI")
+    total_processed = 0
+    total_skipped = 0
+
+    with open(jsonl_path, "r") as f:
+        for line in tqdm(f, total=total_lines, desc="SenseNova-SI"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data_item = json.loads(line)
+            except Exception as e:
+                print(f"    [WARN] bad JSON line: {e}")
+                total_skipped += 1
+                continue
+
+            # Derive geo row
+            geo_row = _sensenova_si_item_to_row(data_item, image_root, task_type='geo')
+            # Derive und row
+            und_row = _sensenova_si_item_to_row(data_item, image_root, task_type='und')
+
+            if geo_row is None or und_row is None:
+                total_skipped += 1
+                continue
+
+            n_images = len(geo_row["image_path"])
+            if n_images > max_images_per_sample:
+                total_skipped += 1
+                continue
+            
+
+            img_stats.record(n_images, {
+                "id": data_item.get("id", ""),
+                "image_path": geo_row["image_path"],
+                "question": geo_row["question"][:200] if geo_row["question"] else "",
+            })
+
+            geo_writer.add(geo_row)
+            und_writer.add(und_row)
+            total_processed += 1
+
+    print(f"[SenseNova-SI] processed={total_processed}, skipped={total_skipped}")
+    img_stats.print_summary()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  CSV saving & HuggingFace upload helper
+# ═════════════════════════════════════════════════════════════════════════
+
+def _save_csv_and_upload_hf(
+    rows: List[dict],
+    csv_output_path: Optional[str],
+    hf_repo: Optional[str],
+    dataset_label: str = "dataset",
+):
+    """
+    Save collected rows to a local CSV file and optionally upload to
+    HuggingFace Hub as a dataset.
+
+    List/dict columns are JSON-serialised so that CSV stays readable.
+    """
+    # ── Prepare DataFrame ──
+    # Serialise non-scalar columns to JSON strings for CSV compatibility
+    df_rows = []
+    for r in rows:
+        flat = {}
+        for k, v in r.items():
+            if isinstance(v, (list, dict)):
+                flat[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                flat[k] = v
+        df_rows.append(flat)
+    df = pd.DataFrame(df_rows)
+
+    # ── Save as TSV locally (VLMEvalKit loads .tsv with tab separator) ──
+    if csv_output_path is None:
+        csv_output_path = f"{dataset_label}_export.tsv"
+    # Ensure the extension is .tsv for compatibility with VLMEvalKit's load()
+    if csv_output_path.endswith(".csv"):
+        csv_output_path = csv_output_path[:-4] + ".tsv"
+    os.makedirs(os.path.dirname(csv_output_path) or ".", exist_ok=True)
+    df.to_csv(csv_output_path, sep='\t', index=False, encoding="utf-8")
+    print(f"\n  ✓ TSV saved to {csv_output_path}  ({len(df)} rows)")
+
+    # ── Upload to HuggingFace Hub ──
+    if hf_repo:
+        try:
+            from datasets import Dataset
+            from huggingface_hub import HfApi
+        except ImportError:
+            print("  [ERROR] 'datasets' and 'huggingface_hub' packages are "
+                  "required for HF upload.  pip install datasets huggingface_hub")
+            return
+
+        print(f"  Uploading CSV to HuggingFace repo: {hf_repo} ...")
+        api = HfApi()
+        # Create the repo if it doesn't exist (dataset type)
+        api.create_repo(repo_id=hf_repo, repo_type="dataset", exist_ok=True)
+        # Upload the CSV file
+        api.upload_file(
+            path_or_fileobj=csv_output_path,
+            path_in_repo=os.path.basename(csv_output_path),
+            repo_id=hf_repo,
+            repo_type="dataset",
+        )
+        print(f"  ✓ Uploaded to https://huggingface.co/datasets/{hf_repo}")
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -702,11 +1018,28 @@ def parse_args():
     p.add_argument("--ost-image-root", type=str, default=None,
                    help="Image root for OST-Bench "
                         "(e.g. .../img_train/)")
+
+    # ── SenseNova-SI ──
+    p.add_argument("--sensenova-si-jsonl", type=str, default=None,
+                   help="Path to SenseNova-SI-800K.jsonl file")
+    p.add_argument("--sensenova-si-image-root", type=str, default=None,
+                   help="Root directory containing the 'images/' folder "
+                        "for SenseNova-SI (the snapshot directory)")
+
     # ── Annotation Control ──
     p.add_argument("--need-3d-annotation", action="store_true", default=False,
         help="Whether to load 3D annotation data (poses, depth, intrinsics). "
             "If False, output directory will have 'no_3d_annotation' suffix."
     )
+
+    # ── CSV & HuggingFace ──
+    p.add_argument("--csv-output", type=str, default=None,
+                   help="Path to save the MindCube TSV file locally "
+                        "(default: <output-dir>/mindcube_export.tsv)")
+    p.add_argument("--hf-repo", type=str, default=None,
+                   help="HuggingFace Hub repo id to upload CSV "
+                        "(e.g. 'your-username/mindcube-spatial'). "
+                        "Requires `huggingface-cli login` beforehand.")
 
     # ── Output ──
     p.add_argument("--output-dir", type=str, required=True,
@@ -764,7 +1097,14 @@ def main():
             args.rows_per_file, args.rows_per_row_group,
             info_tracker=info_tracker,
         )
-        process_mindcube(args.mindcube_json, writer, mindcube_data_root=args.mindcube_data_root)
+        csv_path = args.csv_output or os.path.join(args.output_dir, "mindcube_export.tsv")
+        process_mindcube(
+            args.mindcube_json,
+            writer,
+            mindcube_data_root=args.mindcube_data_root,
+            csv_output_path=csv_path,
+            hf_repo=args.hf_repo,
+        )
         writer.finish()
 
     # ------------------------------------------------------------------
@@ -805,6 +1145,46 @@ def main():
         )
         process_ost(args.ost_file, args.ost_image_root, writer)
         writer.finish()
+
+    # ------------------------------------------------------------------
+    #  SenseNova-SI  (produces two parquets: geo & und)
+    # ------------------------------------------------------------------
+    if args.sensenova_si_jsonl is not None:
+        any_dataset = True
+        if args.sensenova_si_image_root is None:
+            print("[ERROR] --sensenova-si-image-root is required when "
+                  "--sensenova-si-jsonl is given")
+            sys.exit(1)
+
+        # geo writer (with its own info tracker → separate parquet_info.json)
+        geo_out = (os.path.join(args.output_dir, "sensenova_si_geo")
+                   if args.split_by_dataset else args.output_dir)
+        geo_info_tracker = ParquetInfoTracker(geo_out)
+        geo_writer = ParquetBufferedWriter(
+            geo_out, "sensenova_si_geo", ARROW_SCHEMA,
+            args.rows_per_file, args.rows_per_row_group,
+            info_tracker=geo_info_tracker,
+        )
+        # und writer (with its own info tracker → separate parquet_info.json)
+        und_out = (os.path.join(args.output_dir, "sensenova_si_und")
+                   if args.split_by_dataset else args.output_dir)
+        und_info_tracker = ParquetInfoTracker(und_out)
+        und_writer = ParquetBufferedWriter(
+            und_out, "sensenova_si_und", ARROW_SCHEMA,
+            args.rows_per_file, args.rows_per_row_group,
+            info_tracker=und_info_tracker,
+        )
+
+        process_sensenova_si(
+            args.sensenova_si_jsonl,
+            args.sensenova_si_image_root,
+            geo_writer,
+            und_writer,
+        )
+        geo_writer.finish()
+        und_writer.finish()
+        geo_info_tracker.summary()
+        und_info_tracker.summary()
 
     # ------------------------------------------------------------------
     #  Finish
