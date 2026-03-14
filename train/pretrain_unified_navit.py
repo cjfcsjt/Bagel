@@ -46,9 +46,35 @@ from modeling.g2vlm import (
     Dinov2WithRegistersConfig, Dinov2WithRegistersModel
 )
 from modeling.qwen2vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
-# from modeling.qwen2vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
-from transformers import Qwen2VLForConditionalGeneration
+from modeling.qwen2vl.modeling_qwen2_vl import Qwen2VLForConditionalGeneration
+# from transformers import Qwen2VLForConditionalGeneration
 from modeling.qwen2vl.configuration_qwen2_vl import Qwen2VLVisionConfig
+
+def save_configs_and_tokenizer(
+    save_path, config, llm_config, vit_config, dino_config,
+    tokenizer, training_args, logger
+):
+    """Save model configs and tokenizer to checkpoint directory (rank 0 only)."""
+    if dist.get_rank() != 0:
+        return
+    # Save overall G2VLM config
+    config.to_json_file(os.path.join(save_path, "config.json"))
+    logger.info(f"Saved config.json to {save_path}")
+    # Save LLM config
+    llm_config.to_json_file(os.path.join(save_path, "llm_config.json"))
+    logger.info(f"Saved llm_config.json to {save_path}")
+    # Save ViT config (if visual understanding is enabled)
+    if training_args.visual_und and vit_config is not None:
+        vit_config.to_json_file(os.path.join(save_path, "vit_config.json"))
+        logger.info(f"Saved vit_config.json to {save_path}")
+    # Save DINO config (if visual reconstruction is enabled)
+    if training_args.visual_recon and dino_config is not None:
+        dino_config.to_json_file(os.path.join(save_path, "dino_config.json"))
+        logger.info(f"Saved dino_config.json to {save_path}")
+    # Save tokenizer
+    tokenizer.save_pretrained(save_path)
+    logger.info(f"Saved tokenizer to {save_path}")
+
 
 def count_parameters(module: torch.nn.Module) -> int:
     return sum(p.numel() for p in module.parameters())
@@ -121,8 +147,8 @@ class ModelArguments:
         metadata={"help": "Enable QK LayerNorm (qk_norm) inside the attention blocks."}
     )
     layer_scale: bool = field(
-        default=False,
-        metadata={"help": "Enable QK LayerNorm (qk_norm) inside the attention blocks."}
+        default=True,
+        metadata={"help": "Enable Layer Scale (layer_scale) inside the attention blocks."}
     )
     tie_word_embeddings: bool = field(
         default=False,
@@ -588,55 +614,55 @@ def main():
             language_model.init_moe() # 这个方法会复制初始化 MoE（Mixture of Experts）专家的权重, 确保每个专家在训练开始时有相同的初始化，避免随机初始化导致的不稳定
 
         # 检查并修复 LayerScale 参数初始化状态
-        if dist.get_rank() == 0:
-            print("=" * 80)
-            print("Checking NEW (not in checkpoint) parameters after language model initialization...")
-            # 检查所有新增模块的参数（不在原始 checkpoint 中的）
-            new_module_patterns = ['ls1.gamma', 'ls2.gamma', 'moe_geo', 'norm_moe_geo']
-            new_params = {}
-            for name, param in language_model.named_parameters():
-                # if any(pat in name for pat in new_module_patterns):
-                new_params[name] = {
-                    'shape': param.shape,
-                    'dtype': param.dtype,
-                    'device': param.device,
-                    'is_meta': param.is_meta,
-                    'min': param.min().item() if not param.is_meta else 'META',
-                    'max': param.max().item() if not param.is_meta else 'META',
-                    'mean': param.mean().item() if not param.is_meta else 'META',
-                    'has_nan': torch.isnan(param).any().item() if not param.is_meta else 'META',
-                    'has_inf': torch.isinf(param).any().item() if not param.is_meta else 'META',
-                    'all_zero': (param == 0).all().item() if not param.is_meta else 'META',
-                    'first_5': param.data.flatten()[:5].tolist() if not param.is_meta else 'META',
-                }
+        # if dist.get_rank() == 0:
+        #     print("=" * 80)
+        #     print("Checking NEW (not in checkpoint) parameters after language model initialization...")
+        #     # 检查所有新增模块的参数（不在原始 checkpoint 中的）
+        #     new_module_patterns = ['ls1.gamma', 'ls2.gamma', 'moe_geo', 'norm_moe_geo']
+        #     new_params = {}
+        #     for name, param in language_model.named_parameters():
+        #         # if any(pat in name for pat in new_module_patterns):
+        #         new_params[name] = {
+        #             'shape': param.shape,
+        #             'dtype': param.dtype,
+        #             'device': param.device,
+        #             'is_meta': param.is_meta,
+        #             'min': param.min().item() if not param.is_meta else 'META',
+        #             'max': param.max().item() if not param.is_meta else 'META',
+        #             'mean': param.mean().item() if not param.is_meta else 'META',
+        #             'has_nan': torch.isnan(param).any().item() if not param.is_meta else 'META',
+        #             'has_inf': torch.isinf(param).any().item() if not param.is_meta else 'META',
+        #             'all_zero': (param == 0).all().item() if not param.is_meta else 'META',
+        #             'first_5': param.data.flatten()[:5].tolist() if not param.is_meta else 'META',
+        #         }
             
-            if new_params:
-                print(f"Found {len(new_params)} NEW parameters (not in original checkpoint)")
-                problematic_count = 0
-                for name, stats in new_params.items():
-                    is_bad = stats['is_meta'] or stats['has_nan'] or stats['has_inf'] or stats['all_zero']
-                    marker = "⚠️" if is_bad else "✅"
-                    if is_bad:
-                        problematic_count += 1
-                    print(f"  {marker} {name}")
-                    print(f"      Shape: {stats['shape']}, Device: {stats['device']}, is_meta: {stats['is_meta']}")
-                    print(f"      min={stats['min']}, max={stats['max']}, mean={stats['mean']}")
-                    print(f"      has_nan={stats['has_nan']}, has_inf={stats['has_inf']}, all_zero={stats['all_zero']}")
-                    print(f"      First 5: {stats['first_5']}")
+        #     if new_params:
+        #         print(f"Found {len(new_params)} NEW parameters (not in original checkpoint)")
+        #         problematic_count = 0
+        #         for name, stats in new_params.items():
+        #             is_bad = stats['is_meta'] or stats['has_nan'] or stats['has_inf'] or stats['all_zero']
+        #             marker = "⚠️" if is_bad else "✅"
+        #             if is_bad:
+        #                 problematic_count += 1
+        #             print(f"  {marker} {name}")
+        #             print(f"      Shape: {stats['shape']}, Device: {stats['device']}, is_meta: {stats['is_meta']}")
+        #             print(f"      min={stats['min']}, max={stats['max']}, mean={stats['mean']}")
+        #             print(f"      has_nan={stats['has_nan']}, has_inf={stats['has_inf']}, all_zero={stats['all_zero']}")
+        #             print(f"      First 5: {stats['first_5']}")
                 
-                if problematic_count > 0:
-                    print(f"\n⚠️ Found {problematic_count} problematic parameters! Reinitializing LayerScale...")
-                    for name, param in language_model.named_parameters():
-                        if 'ls1.gamma' in name or 'ls2.gamma' in name:
-                            if param.is_meta or torch.isnan(param).any() or torch.isinf(param).any():
-                                with torch.no_grad():
-                                    param.data = torch.full_like(param, 0.01, device='cpu') if param.is_meta else param.data.fill_(0.01)
-                                print(f"  ✅ Reinitialized {name} to 0.01")
-                else:
-                    print("✅ All new parameters look healthy!")
-            else:
-                print("No new parameters found in language model")
-            print("=" * 80)
+        #         if problematic_count > 0:
+        #             print(f"\n⚠️ Found {problematic_count} problematic parameters! Reinitializing LayerScale...")
+        #             for name, param in language_model.named_parameters():
+        #                 if 'ls1.gamma' in name or 'ls2.gamma' in name:
+        #                     if param.is_meta or torch.isnan(param).any() or torch.isinf(param).any():
+        #                         with torch.no_grad():
+        #                             param.data = torch.full_like(param, 0.01, device='cpu') if param.is_meta else param.data.fill_(0.01)
+        #                         print(f"  ✅ Reinitialized {name} to 0.01")
+        #         else:
+        #             print("✅ All new parameters look healthy!")
+        #     else:
+        #         print("No new parameters found in language model")
+        #     print("=" * 80)
     
     # 2. 根据任务需求，加载视觉模型
     if training_args.visual_und:  
@@ -644,15 +670,17 @@ def main():
             # Load Qwen2VL model, 是基于DFN（Dual-Feature Network）架构的视觉模型, qwen已经将固定位置编码替换成RoPR-2D
             if training_args.finetune_from_hf:
                 vit_config = Qwen2VLVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
+                vit_config.patch_size = 14
             else:
-                vit_config = Qwen2VLVisionConfig.from_pretrained(model_args.vit_path)
-            vit_config.patch_size = 14
-            vit_config.initializer_range = 0.02
+                vlm_config = Qwen2VLConfig.from_pretrained(model_args.vit_path)
+                vit_config = vlm_config.vision_config
+                vit_config.patch_size = 14
+            
             if training_args.finetune_from_hf:
                 vit_model = Qwen2VisionTransformerPretrainedModel(vit_config)
             else:
-                full = Qwen2VLForConditionalGeneration.from_pretrained(model_args.vit_path, device_map="cpu")
-                vit_model = full.model.visual
+                full = Qwen2VLForConditionalGeneration.from_pretrained(model_args.vit_path, attn_implementation="flash_attention_2", device_map="cpu")
+                vit_model = full.visual
                 # vit_model = Qwen2VisionTransformerPretrainedModel.from_pretrained(model_args.vit_path, config=vit_config)
         elif model_args.vit_type == "siglip":
             # Load SigLIP model (default)
@@ -710,7 +738,7 @@ def main():
         dino_mask_ratio=[float(r) for r in training_args.dino_mask_ratio.split(',')] if training_args.dino_mask_ratio else None,
         dino_num_ref=training_args.dino_num_ref,
     )
-    
+    print(f"config.use_dino_masking =  {config.use_dino_masking}")
     model = G2VLM(
         language_model, 
         vit_model if training_args.visual_und else None, 
@@ -777,10 +805,31 @@ def main():
         check_fn=grad_checkpoint_check_fn
     )
 
+    # if dist.get_rank() == 0:
+    #     print(fsdp_model)
+        # for name, param in model.named_parameters():
+        #     print(name, param.requires_grad)
+
+    # === Debug: check GPU memory after FSDP wrapping ===
+    import time as _time
+    torch.cuda.synchronize()
+    mem_alloc = torch.cuda.memory_allocated() / 1024**3
+    mem_reserved = torch.cuda.memory_reserved() / 1024**3
+    logger.info(f"[GPU {dist.get_rank()}] After FSDP wrap (before empty_cache): allocated={mem_alloc:.2f} GB, reserved={mem_reserved:.2f} GB")
+    print(f"[GPU {dist.get_rank()}] After FSDP wrap (before empty_cache): allocated={mem_alloc:.2f} GB, reserved={mem_reserved:.2f} GB", flush=True)
+    # Force release the CUDA cache pool to see real memory usage
+    torch.cuda.empty_cache()
+    mem_alloc2 = torch.cuda.memory_allocated() / 1024**3
+    mem_reserved2 = torch.cuda.memory_reserved() / 1024**3
+    logger.info(f"[GPU {dist.get_rank()}] After empty_cache: allocated={mem_alloc2:.2f} GB, reserved={mem_reserved2:.2f} GB")
+    print(f"[GPU {dist.get_rank()}] After empty_cache: allocated={mem_alloc2:.2f} GB, reserved={mem_reserved2:.2f} GB", flush=True)
+    dist.barrier()
     if dist.get_rank() == 0:
-        print(fsdp_model)
-        for name, param in model.named_parameters():
-            print(name, param.requires_grad)
+        logger.info("Sleeping 120s for GPU memory inspection (use nvidia-smi)...")
+        print("Sleeping 120s for GPU memory inspection (use nvidia-smi)...", flush=True)
+    # _time.sleep(120)
+    dist.barrier()
+    # === End debug ===
 
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(
@@ -861,6 +910,70 @@ def main():
     #     vae_model.to(device).eval()
     fsdp_model.train()
     ema_model.eval()
+
+    # ==================== DEBUG: Check packed_dino_image_tensor_list reshape ====================
+    # logger.info("=" * 80)
+    # logger.info("[DEBUG] Starting data-loader sanity check: finding FIRST bad batch...")
+    # logger.info("=" * 80)
+    # debug_max_steps = 500  # check up to 500 batches
+    # debug_found_error = False
+
+    # for debug_step, debug_data in enumerate(train_loader):
+    #     if debug_step >= debug_max_steps:
+    #         break
+    #     debug_data = debug_data.cuda(device).to_dict()
+    #     debug_data_indexes = debug_data.pop('batch_data_indexes', None)
+    #     _ = debug_data.pop('ce_loss_weights', None)
+
+    #     if 'packed_dino_image_tensor_list' in debug_data and debug_data['packed_dino_image_tensor_list'] is not None:
+    #         packed_dino = debug_data['packed_dino_image_tensor_list']
+    #         img_per_seq_lens = debug_data.get('img_per_seq_lens', [])
+    #         BS, C_in, H, W = packed_dino.shape
+    #         S = img_per_seq_lens[0] if len(img_per_seq_lens) > 0 else 0
+
+    #         all_same = all(x == S for x in img_per_seq_lens)
+    #         B = BS // S if S > 0 else 0
+    #         can_reshape = (S > 0) and (BS == B * S)
+
+    #         if not all_same or not can_reshape:
+    #             debug_found_error = True
+    #             logger.error(f"[DEBUG] !!!!! FIRST RESHAPE ERROR at step={debug_step} (out of {debug_max_steps} max) !!!!!")
+    #             logger.error(f"[DEBUG]   packed_dino.shape={packed_dino.shape}, BS={BS}")
+    #             logger.error(f"[DEBUG]   img_per_seq_lens={img_per_seq_lens}")
+    #             logger.error(f"[DEBUG]   S={S}, B={B}, B*S={B*S}, all_same={all_same}, can_reshape={can_reshape}")
+    #             logger.error(f"[DEBUG]   sample_lens={debug_data.get('sample_lens', 'N/A')}")
+    #             if debug_data_indexes is not None:
+    #                 logger.error(f"[DEBUG]   batch_data_indexes={debug_data_indexes}")
+    #             raise RuntimeError(
+    #                 f"[DEBUG] First bad batch at step={debug_step}. "
+    #                 f"img_per_seq_lens={img_per_seq_lens}, packed_dino.shape={packed_dino.shape}."
+    #             )
+    #         else:
+    #             if debug_step % 50 == 0:
+    #                 logger.info(f"[DEBUG] step={debug_step} OK: packed_dino.shape={packed_dino.shape}, "
+    #                             f"img_per_seq_lens={img_per_seq_lens}, B={B}, S={S}")
+    #     else:
+    #         if debug_step % 50 == 0:
+    #             logger.info(f"[DEBUG] step={debug_step}: No packed_dino in this batch, skipping.")
+
+    # if not debug_found_error:
+    #     logger.info(f"[DEBUG] Checked {min(debug_step + 1, debug_max_steps)} batches, NO reshape error found.")
+
+    # logger.info("=" * 80)
+    # logger.info("[DEBUG] Data-loader sanity check finished. Recreating data loader for actual training...")
+    # # Recreate the dataset and dataloader for actual training (since the iterator is consumed)
+    # train_dataset.set_epoch(train_step)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     batch_size=1,
+    #     num_workers=data_args.num_workers,
+    #     pin_memory=True,
+    #     collate_fn=collate_wrapper(),
+    #     drop_last=True,
+    #     prefetch_factor=data_args.prefetch_factor,
+    # )
+    # logger.info("[DEBUG] Data loader recreated. Starting actual training...")
+    # ==================== END DEBUG ====================
 
     # train loop
     start_time = time()
@@ -1042,6 +1155,18 @@ def main():
                 fsdp_config=fsdp_config,
                 data_status=gather_list
             )
+            # Save configs and tokenizer alongside checkpoint
+            ckpt_save_path = os.path.join(training_args.checkpoint_dir, f"{curr_step:07d}")
+            save_configs_and_tokenizer(
+                save_path=ckpt_save_path,
+                config=config,
+                llm_config=llm_config,
+                vit_config=vit_config if training_args.visual_und else None,
+                dino_config=dino_config if training_args.visual_recon else None,
+                tokenizer=tokenizer,
+                training_args=training_args,
+                logger=logger,
+            )
             # Clear CUDA cache and force garbage collection after checkpoint to free memory
             gc.collect()
             torch.cuda.empty_cache()
@@ -1084,6 +1209,18 @@ def main():
             logger=logger,
             fsdp_config=fsdp_config,
             data_status=gather_list
+        )
+        # Save configs and tokenizer alongside final checkpoint
+        ckpt_save_path = os.path.join(training_args.checkpoint_dir, f"{curr_step:07d}")
+        save_configs_and_tokenizer(
+            save_path=ckpt_save_path,
+            config=config,
+            llm_config=llm_config,
+            vit_config=vit_config if training_args.visual_und else None,
+            dino_config=dino_config if training_args.visual_recon else None,
+            tokenizer=tokenizer,
+            training_args=training_args,
+            logger=logger,
         )
         # Clear CUDA cache and force garbage collection after final checkpoint
         gc.collect()
