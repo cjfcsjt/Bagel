@@ -248,10 +248,15 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['nested_attention_masks'] = sequence_status['nested_attention_masks']
         else:
             sequence_len = data['sequence_length']
-            pad_len = self.max_num_tokens - sequence_len #### this is fixed only postive num
-            data['split_lens'] = sequence_status['split_lens'] + [pad_len]
-            data['attn_modes'] = sequence_status['attn_modes'] + ['causal']
-            data['sample_lens'] += [pad_len]
+            pad_len = self.max_num_tokens - sequence_len
+            if pad_len > 0:
+                data['split_lens'] = sequence_status['split_lens'] + [pad_len]
+                data['attn_modes'] = sequence_status['attn_modes'] + ['causal']
+                data['sample_lens'] += [pad_len]
+            else:
+                # sequence_len >= max_num_tokens, no padding needed
+                data['split_lens'] = sequence_status['split_lens']
+                data['attn_modes'] = sequence_status['attn_modes']
         
         if len(sequence_status['packed_dino_image_tensor_list']) > 0: 
 
@@ -398,6 +403,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 yield_count += 1
                 data = self.to_tensor(sequence_status)
                 data['batch_data_indexes'] = batch_data_indexes
+                print(f"[Rank {self.local_rank} Worker  Loop {loop_count}] Yield #{yield_count}: "
+                      f"tokens={sum(sequence_status['sample_lens'])}, samples={len(sequence_status['sample_lens'])}")
                 yield data
                 sequence_status = self.set_sequence_status()
                 batch_data_indexes = []
@@ -488,7 +495,6 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     curr += 1
                     curr_split_len += 1
 
-                attn_modes.append("causal")
                 pos_ids = torch.tensor(range(curr_rope_id, curr_rope_id + curr_split_len), dtype=torch.long).expand(3, -1),
                 sequence_status['packed_position_ids'].extend(pos_ids)
                 curr_rope_id += curr_split_len
@@ -544,9 +550,6 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
                 sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
                 curr_rope_id += 1
-
-                attn_modes.append("full") # changed to noise
-       
 
             elif item['type'] == 'dino_image':
                 dino_cnt+=1
@@ -645,10 +648,21 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
                 curr_rope_id += 1
 
-                # update sequence status
-                attn_modes.append("full")
-
+            # 4 dino + 1 text + 1 ans
+            # 修改前（每个 DINO 图像是独立 split）：
+            # split_lens = [L1, L2, L3, L4, L_q, L_a]
+            # attn_modes = ["full", "full", "full", "full", "causal", "causal"]
+            # → dino_1 看不到 dino_2/3/4，dino_2 看不到 dino_3/4 ...
+            # 修改后（所有 DINO 图像合并为一个 split）：
+            # split_lens = [L1+L2+L3+L4, L_q, L_a]
+            # attn_modes = ["full", "causal", "causal"] 
+            # → 所有 DINO 图像的 token 在一个 "full" split 中互相双向可见
             if item.get('split_end', True):
+                # Determine attn_mode based on item type
+                if item['type'] in ('dino_image', 'vit_image'):
+                    attn_modes.append("full")
+                else:
+                    attn_modes.append("causal")
                 split_lens.append(curr_split_len)
                 sample_lens += curr_split_len
 

@@ -5,12 +5,13 @@ from .interleave_datasets import UnifiedEditIterableDataset
 from .recon_dataset import SftJSONLIterableReconDataset
 from .vlm_dataset import SftJSONLIterableDataset
 from .interleave_datasets.recon_then_und_dataset import ReconthenUndIterableDataset
-
+from .interleave_datasets.recon_dataset_parquet import ReconParquetIterableDataset
 
 DATASET_REGISTRY = {
     'recon': SftJSONLIterableReconDataset,
     'vlm_sft': SftJSONLIterableDataset,
     'recon_then_und': ReconthenUndIterableDataset,
+    'recon_parquet': ReconParquetIterableDataset,
     'unified_edit': UnifiedEditIterableDataset,
 }
 
@@ -34,17 +35,32 @@ DATASET_INFO = {
     },
     'vlm_sft': {
         'llava_ov': {
-			'data_dir': '/data/spatial_data/reason_data/bagel_converted/vlm/images',
-			'jsonl_path': '/data/spatial_data/reason_data/bagel_converted/vlm/llava_ov_si.jsonl',
+			'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/bagel_converted/vlm/images',
+			'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/bagel_converted/vlm/llava_ov_si.jsonl',
 			'num_total_samples': 50000
 		},
     },
 	'recon_then_und':{
 		'spatial_mix': {
-			'data_dir': "/data/spatial_data/reason_data/unified_parquets/spar_no_3d_annotation/",
-			'num_files': 17,
+			'data_dir': "/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube10/mindcube",
+			'num_files': 1,
 			'num_total_samples': 7901248,
-			"parquet_info_path": '/data/spatial_data/reason_data/unified_parquets/parquet_info.json', # information of the parquet files
+			"parquet_info_path": '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube10/parquet_info.json', # information of the parquet files
 		},
-	},
+        'sensense_und': {
+            'data_dir': "/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_sense800k_dual_tmp/sensenova_si_und",
+            # 'num_files': 2,
+            # 'num_total_samples': 800000,
+            "parquet_info_path": '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_sense800k_dual_tmp/sensenova_si_und/parquet_info.json', # information of the parquet files
+        }
+		
+    },
+    'recon_parquet':{
+        'sensense_geo': {
+            'data_dir': "/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_sense800k_dual_tmp/sensenova_si_geo",
+            # 'num_files': 2,
+            # 'num_total_samples': 800000,
+            "parquet_info_path": '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_sense800k_dual_tmp/sensenova_si_geo/parquet_info.json', # information of the parquet files
+        }
+    },
 }

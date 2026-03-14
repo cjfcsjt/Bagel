@@ -325,7 +325,7 @@ def len2weight(x, loss_reduction='square'):
     raise NotImplementedError(loss_reduction)
 
 
-def apply_template_qwenvl2_reconThenUnd(question_with_image_tokens,answer):
+def apply_template_qwenvl2_reconThenUnd(question_with_image_tokens,answer,task):
     chat_template1 = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
     chat_template2=question_with_image_tokens
     chat_template3= '<|im_end|>\n<|im_start|>assistant'
@@ -340,11 +340,12 @@ def apply_template_qwenvl2_reconThenUnd(question_with_image_tokens,answer):
         'loss':False,
         'value':chat_template1,
     })
-    ret.append({
-        'type':'text',
-        'loss':False,
-        'value':'Reconstruct the 3D scene.',
-    }) 
+    if 'geo' in task:
+        ret.append({
+            'type':'text',
+            'loss':False,
+            'value':'Reconstruct the 3D scene.',
+        }) 
     
     for split_ in chat_template2_split:
         if split_ not in ['<vit_image>','<dino_image>']:

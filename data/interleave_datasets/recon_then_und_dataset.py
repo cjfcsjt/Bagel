@@ -11,6 +11,7 @@ from ..dataset_utils_vggt import *
 import torch
 from copy import deepcopy
 import traceback
+import cv2
 import modeling.pi3.utils.cropping as cropping
 from modeling.pi3.utils.geometry import depthmap_to_absolute_camera_coordinates
 from .draw_marker import DRAW_FUNCTIONS
@@ -42,6 +43,7 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
         self.random_aspect_ratio = 1.0
         self.resolution = [518, 518]  
         self.spar5m_get_nearby_ids = False
+        self.shuffle_seq_views = True
 
     def pop_first(self, arr):
         first_val = arr[0]
@@ -115,6 +117,222 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
         other = [x for x in [normal, far_mask] if x is not None]
         return image, depthmap, intrinsics2, *other
 
+    # ────────────────────────── View Sampling ──────────────────────────
+
+    def _sample_view_indices(self, num_imgs, rng, max_distance=10):
+        """
+        Sample self.frame_num view indices from num_imgs available views.
+
+        Strategies:
+            - Fully random sampling (when frame_num > 16 and random threshold met)
+            - Distance-based neighborhood sampling (50% chance)
+            - Stratified sampling (50% chance)
+
+        Args:
+            num_imgs: total number of available views in the scene
+            rng: numpy random generator
+            max_distance: max distance parameter for distance-based sampling
+
+        Returns:
+            idxs: list of int, sampled view indices of length self.frame_num
+        """
+        if self.frame_num > 16 and rng.random() < self.random_sample_thres:
+            # Fully random sampling
+            should_replace = num_imgs < self.frame_num
+            idxs = list(rng.choice(range(num_imgs), size=self.frame_num, replace=should_replace))
+        else:
+            # Distance-based sampling: pick a random anchor
+            idxs = [rng.integers(0, num_imgs)]
+            scaled_max_distance = int(max_distance / 8 * self.frame_num)
+
+            start_idx = max(0, idxs[-1] - scaled_max_distance)
+            end_idx = min(num_imgs - 1, start_idx + 2 * scaled_max_distance)
+            start_idx = max(0, end_idx - 2 * scaled_max_distance)
+            valid_indices = np.arange(start_idx, end_idx + 1)
+
+            if rng.random() < 0.5:
+                # Random neighborhood sampling
+                should_replace = len(valid_indices) < self.frame_num - 1
+                idxs.extend(list(rng.choice(valid_indices, size=self.frame_num - 1, replace=should_replace)))
+            else:
+                # Stratified sampling
+                ref_frame_val = idxs[0]
+                num_additional_to_select = self.frame_num - 1
+                additional_selected_values = []
+                pool_for_others_values = sorted(list(valid_indices))
+
+                should_replace_for_others = len(pool_for_others_values) < num_additional_to_select
+
+                if not pool_for_others_values:
+                    if should_replace_for_others:
+                        additional_selected_values = [ref_frame_val] * num_additional_to_select
+                else:
+                    if not should_replace_for_others and len(pool_for_others_values) >= num_additional_to_select:
+                        strata = np.array_split(pool_for_others_values, num_additional_to_select + 1)
+                        for stratum in strata:
+                            if len(stratum) > 0 and ref_frame_val not in stratum:
+                                additional_selected_values.append(rng.choice(stratum))
+                    else:
+                        additional_selected_values = list(rng.choice(
+                            pool_for_others_values,
+                            num_additional_to_select,
+                            replace=(should_replace_for_others or (len(pool_for_others_values) < num_additional_to_select))
+                        ))
+
+                idxs = [ref_frame_val, *additional_selected_values]
+
+        assert len(idxs) == self.frame_num, (
+            f"Expected {self.frame_num} frames, but got {len(idxs)} frames. idxs: {idxs}"
+        )
+        return idxs
+
+    # ────────────────────────── Depth & Camera Loading ──────────────────────────
+
+    def _load_depth_and_camera(self, scene_name, depth_path, pose, intri, image):
+        """
+        Load depth map and camera parameters based on scene type.
+        Extracts the per-scene depth loading logic from the old _add_image.
+
+        Args:
+            scene_name: str, dataset scene name
+            depth_path: str, path to depth file
+            pose: array-like, camera extrinsic (will be reshaped to 4x4)
+            intri: array-like, camera intrinsic (will be reshaped and sliced to 3x3)
+            image: np.ndarray, RGB image (H, W, 3)
+
+        Returns:
+            depth_map: np.ndarray (H, W) float
+            extri_opencv: np.ndarray (4, 4) float
+            intri_opencv: np.ndarray (3, 3) float
+            image: np.ndarray (possibly resized to match depth)
+        """
+        if scene_name == 'matterport3d':
+            with Image.open(depth_path) as depth_img:
+                depth_map = np.array(depth_img).astype(np.int32) / 4000.0
+            depth_map[~np.isfinite(depth_map)] = 0
+
+            threshold = (
+                np.percentile(depth_map[depth_map > 0], 98)
+                if depth_map[depth_map > 0].size > 0
+                else 0
+            )
+            depth_map[depth_map > threshold] = 0.0
+
+            extri_opencv = np.array(pose).reshape((4, 4))
+            intri_opencv = np.array(intri)[:3, :3]
+
+        elif scene_name == 'scannet':
+            with Image.open(depth_path) as depth_img:
+                depth_map = np.array(depth_img).astype(np.int32) / 1000.0
+            depth_map[~np.isfinite(depth_map)] = 0
+            if depth_map.shape[0] != image.shape[0]:
+                image = cv2.resize(image, (depth_map.shape[1], depth_map.shape[0]), interpolation=cv2.INTER_LINEAR)
+            extri_opencv = np.array(pose).reshape((4, 4))
+            intri_opencv = np.array(intri)[:3, :3]
+
+        elif scene_name == '3rscan':
+            with Image.open(depth_path) as depth_img:
+                depth_map = np.array(depth_img).astype(np.int32) / 1000.0
+            depth_map[~np.isfinite(depth_map)] = 0
+            extri_opencv = np.array(pose).reshape((4, 4))
+            intri_opencv = np.array(intri)[:3, :3]
+
+        elif scene_name == 'scannetpp':
+            with Image.open(depth_path) as depth_img:
+                depth_map = np.array(depth_img).astype(np.int32) / 1000.0
+            depth_map[~np.isfinite(depth_map)] = 0
+            if depth_map.shape[0] != image.shape[0] or depth_map.shape[1] != image.shape[1]:
+                depth_map = cv2.resize(
+                    depth_map,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST
+                )
+            extri_opencv = np.array(pose).reshape((4, 4))
+            intri_opencv = np.array(intri)[:3, :3]
+
+        elif scene_name == 'structured3d':
+            with Image.open(depth_path) as depth_img:
+                depth_map = np.array(depth_img).astype(np.int32) / 1000.0
+            depth_map[~np.isfinite(depth_map)] = 0
+            extri_opencv = np.array(pose).reshape((4, 4))
+            extri_opencv[:3, 3] = extri_opencv[:3, 3] / 1000.0
+            intri_opencv = np.array(intri)[:3, :3]
+
+        else:
+            raise ValueError(f"Unsupported scene type for depth loading: {scene_name}")
+
+        return depth_map, extri_opencv, intri_opencv, image
+
+    # ────────────────────────── Postprocessing (Shared) ──────────────────────────
+
+    def _postprocess_views(self, raw_views, rng):
+        """
+        Apply crop/resize preprocessing to raw views that have 3D annotations.
+
+        Args:
+            raw_views: list of dicts, each with keys:
+                - image: np.ndarray (H, W, 3) RGB
+                - depth: np.ndarray (H, W) depth map
+                - extrinsic: np.ndarray (4, 4) cam2world
+                - intrinsic: np.ndarray (3, 3)
+                - view_info: str
+            rng: numpy random generator
+
+        Returns:
+            images: list of PIL images (after crop/resize)
+            depths: list of depth maps (after crop/resize)
+            extrinsics: list of 4x4 extrinsic matrices (unchanged)
+            intrinsics: list of 3x3 intrinsic matrices (after crop/resize)
+            view_infos: list of view info strings
+        """
+        images, depths, extrinsics, intrinsics, view_infos = [], [], [], [], []
+
+        for v in raw_views:
+            img, dep, intri = self._crop_resize_if_necessary(
+                v['image'], v['depth'], v['intrinsic'].copy(),
+                self.resolution, rng=rng, info=v['view_info']
+            )
+            images.append(img)
+            depths.append(dep)
+            extrinsics.append(v['extrinsic'].astype(np.float32))
+            intrinsics.append(intri.astype(np.float32))
+            view_infos.append(v['view_info'])
+
+        return images, depths, extrinsics, intrinsics, view_infos
+
+    def _simple_resize_views(self, image_paths, idxs, scene_label, scene_id):
+        """
+        Simple image loading and resize for views without 3D annotations.
+
+        Args:
+            image_paths: list of all available image paths
+            idxs: list of sampled indices
+            scene_label: str, scene name for view_info
+            scene_id: str, sequence name for view_info
+
+        Returns:
+            images: list of PIL images (resized to self.resolution)
+            depths: list of zero arrays (placeholder)
+            extrinsics: list of identity matrices (placeholder)
+            intrinsics: list of identity matrices (placeholder)
+            view_infos: list of view info strings
+        """
+        images, depths, extrinsics, intrinsics, view_infos = [], [], [], [], []
+        h, w = self.resolution
+
+        for idx in idxs:
+            img_path = image_paths[idx]
+            image = Image.open(img_path).convert('RGB')
+            image = image.resize((w, h), Image.LANCZOS)
+
+            images.append(image)
+            depths.append(np.zeros((h, w), dtype=np.float32))
+            extrinsics.append(np.eye(4, dtype=np.float32))
+            intrinsics.append(np.eye(3, dtype=np.float32))
+            view_infos.append(f"{scene_label}/{scene_id}/{idx}")
+
+        return images, depths, extrinsics, intrinsics, view_infos
+
     def get_target_shape(self, aspect_ratio):
         """
         Calculate the target shape based on the given aspect ratio.
@@ -175,76 +393,18 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
         )
         return data
 
-    def _add_image(self, data, image, dino_meta, need_loss, need_dino, need_vit, enable_cfg=True, rng=None, view_info=None, has_3d_annotation=True):
+    def _add_image(self, data, image, dino_meta, need_loss, need_dino, need_vit, enable_cfg=True, rng=None, view_info=None, has_3d_annotation=True, split_start=True, split_end=True):
         assert need_loss or need_dino or need_vit
 
         if need_dino:
-            aspect_ratio = 1.0 
             if has_3d_annotation:
-                depth_path = dino_meta['depth']
-                if dino_meta['scene_name'] == 'matterport3d':
-                    with Image.open(depth_path) as depth_img:
-                        depth_map = np.array(depth_img).astype(np.int32) / 4000.0
-                    depth_map[~np.isfinite(depth_map)] = 0
+                # For refactored flow, 3D data is already loaded and preprocessed
+                # dino_meta contains pre-loaded: depth_map, extri_opencv, intrinsic_, image (PIL)
+                depth_map = dino_meta['depth_map']
+                extri_opencv = dino_meta['extri_opencv']
+                intrinsic_ = dino_meta['intrinsic_']
+                original_size = dino_meta.get('original_size', np.array(image.size[::-1]) if isinstance(image, PIL.Image.Image) else np.array(image.shape[:2]))
 
-                    threshold = (
-                        np.percentile(depth_map[depth_map > 0], 98)
-                        if depth_map[depth_map > 0].size > 0
-                        else 0
-                        )
-                    depth_map[depth_map > threshold] = 0.0
-
-                    extri_opencv = dino_meta['pose']
-                    extri_opencv = np.array(extri_opencv).reshape((4,4))
-                    intri_opencv = np.array(dino_meta['intri'])[:3, :3] #3 x 3
-                    
-                elif dino_meta['scene_name'] == 'scannet': 
-                    with Image.open(depth_path) as depth_img:
-                        depth_map = np.array(depth_img).astype(np.int32) / 1000.0
-                    
-                    depth_map[~np.isfinite(depth_map)] = 0
-                    if depth_map.shape[0] != image.shape[0]:
-                        image = cv2.resize(image, (depth_map.shape[1], depth_map.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    extri_opencv = dino_meta['pose'] # 3 x 4 
-                    extri_opencv = np.array(extri_opencv).reshape((4,4))
-                    intri_opencv = np.array(dino_meta['intri'])[:3, :3] #3 x 3
-                elif dino_meta['scene_name'] == '3rscan': 
-                    with Image.open(depth_path) as depth_img:
-                        depth_map = np.array(depth_img).astype(np.int32) / 1000.0
-                    depth_map[~np.isfinite(depth_map)] = 0
-                
-                    extri_opencv = dino_meta['pose'] # 3 x 4 
-                    extri_opencv = np.array(extri_opencv).reshape((4,4))
-                    intri_opencv = np.array(dino_meta['intri'])[:3, :3] #3 x 3
-                elif dino_meta['scene_name'] == 'scannetpp': 
-                    with Image.open(depth_path) as depth_img:
-                        depth_map = np.array(depth_img).astype(np.int32) / 1000.0
-                    depth_map[~np.isfinite(depth_map)] = 0
-                    if depth_map.shape[0] != image.shape[0] or depth_map.shape[1] != image.shape[1]:
-                        depth_map = cv2.resize(
-                            depth_map, 
-                            (image.shape[1], image.shape[0]),  # (width, height) for OpenCV
-                            interpolation=cv2.INTER_NEAREST  # Better for depth maps to preserve sharpness
-                        )
-        
-                    extri_opencv = dino_meta['pose'] # 3 x 4 
-                    extri_opencv = np.array(extri_opencv).reshape((4,4))
-                    intri_opencv = np.array(dino_meta['intri'])[:3, :3] #3 x 3
-                elif dino_meta['scene_name'] == 'structured3d': 
-                    with Image.open(depth_path) as depth_img:
-                        depth_map = np.array(depth_img).astype(np.int32) / 1000.0
-                    depth_map[~np.isfinite(depth_map)] = 0
-            
-                    extri_opencv = dino_meta['pose'] # 3 x 4 
-                    extri_opencv = np.array(extri_opencv).reshape((4,4))
-                    extri_opencv[:3, 3] =  extri_opencv[:3, 3] / 1000.0
-                    intri_opencv = np.array(dino_meta['intri'])[:3, :3] #3 x 3
-
-                original_size = np.array(image.shape[:2])
-
-                image, depth_map, intrinsic_ = self._crop_resize_if_necessary(
-                    image, depth_map, intri_opencv.copy(), self.resolution, rng=rng, info=view_info)
-                                    
                 data['dino_images'].append(image)
                 data['depths'].append(depth_map.astype(np.float32))
                 data['extrinsics'].append(extri_opencv.astype(np.float32))
@@ -252,17 +412,17 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 data['original_sizes'].append(original_size)
                 data['view_infos'].append(view_info)
 
-
-                width, height = image.size
-                if dino_meta['scene_name'] in ['scannet']:
-                    z_far = 80   
-                elif dino_meta['scene_name'] in ['matterport3d']:
-                    z_far = 80   
-                elif dino_meta['scene_name'] in ['3rscan']:
-                    z_far = 80    
+                # Determine z_far based on scene type
+                scene_label = dino_meta.get('scene_name', '')
+                if scene_label in ['scannet']:
+                    z_far = 80
+                elif scene_label in ['matterport3d']:
+                    z_far = 80
+                elif scene_label in ['3rscan']:
+                    z_far = 80
                 else:
-                    z_far = 80    
-            
+                    z_far = 80
+
                 assert np.isfinite(extri_opencv).all(), f'NaN in camera pose for view {view_info}'
                 assert np.isfinite(depth_map).all(), f'NaN in depthmap for view {view_info}'
 
@@ -272,19 +432,19 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 assert valid_mask.sum() > 0, f"viewinfo{view_info}, depthmap{depth_map}"
 
                 data['new_depths'].append(depth_map)
-                data['world_points'] .append(pts3d)
-                data['point_masks'] .append(valid_mask)
+                data['world_points'].append(pts3d)
+                data['point_masks'].append(valid_mask)
             else:
-                # 没有3D标注时，只处理图像，不添加深度和位姿信息
+                # No 3D annotation: placeholder data
                 if not isinstance(image, PIL.Image.Image):
                     image = PIL.Image.fromarray(image)
-                # 简单resize到目标分辨率
-                image = image.resize((self.resolution[1], self.resolution[0]), PIL.Image.LANCZOS)
+                # Simple resize to target resolution
+                # image = image.resize((self.resolution[1], self.resolution[0]), PIL.Image.LANCZOS)
                 data['dino_images'].append(image)
                 data['view_infos'].append(view_info)
                 data['original_sizes'].append(np.array(self.resolution))
                 
-                # 占位数据：与目标分辨率对应的 patch grid 尺寸
+                # Placeholder data
                 patch_h = self.resolution[0] // self.patch_size
                 patch_w = self.resolution[1] // self.patch_size
                 data['depths'].append(np.zeros((self.resolution[0], self.resolution[1]), dtype=np.float32))
@@ -294,16 +454,16 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 data['world_points'].append(np.zeros((self.resolution[0], self.resolution[1], 3), dtype=np.float32))
                 data['point_masks'].append(np.zeros((self.resolution[0], self.resolution[1]), dtype=bool))
             
-            transform_stride =14 #hardcode, 
+            transform_stride = 14  # hardcode
   
             image_tensor = self.dino_transform(image, img_num=1) 
             data['dino_image_tensor_list'].append(image_tensor)
             height, width = image_tensor.shape[1:]
             data['num_tokens'] += width * height // transform_stride ** 2
 
-            grid_t = 1  #patches.shape[0] // self.temporal_patch_size
+            grid_t = 1
             grid_h, grid_w = height // self.patch_size, width // self.patch_size
-            thw_dino = torch.tensor([grid_t, grid_h, grid_w], dtype=torch.long) # Shape: (3,)
+            thw_dino = torch.tensor([grid_t, grid_h, grid_w], dtype=torch.long)
             data['dino_thw'].append(thw_dino)
 
             data['sequence_plan'].append(
@@ -313,6 +473,8 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                     'loss': 0, 
                     'special_token_loss': 0,
                     'special_token_label': None,
+                    'split_start': split_start,
+                    'split_end': split_end,
                 }
             )
 
@@ -381,67 +543,73 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
         question = row["question"]
         answer = row["answer"]
 
-        images_list = []
-        depths_list = []
-        poses_list = []
-        view_infos = []
-        depth_intrinsic_list = []
-        intrinsic_list = []
-
-
-        shuffle_seq_views = False 
-        img_per_seq = self.random_image_num = self.frame_num
-
         data_scene_name = row['scene_name']
         dataset_name = row['dataset_name']
-        
         rng = self._rng
 
-        # 判断是否有3D标注
+        # ── Step 0: Extract scene metadata (pure metadata, no I/O) ──
         has_3d_annotation = (
             'depth_list' in row and row['depth_list'] is not None and len(row.get('depth_list', [])) > 0 and
             'poses' in row and row['poses'] is not None and len(row.get('poses', [])) > 0
         )
 
-        if 'spar' in dataset_name:
-
-            num_imgs = len(row['image_list']) 
-            img_per_seq = num_imgs
-
-            images_list = list(row['image_list'])
-            
-            if has_3d_annotation:
-                depths_list = list(row['depth_list'])
-                poses_list = list(row['poses'])
-
-            this_scene = row['scene_name']
-            
-            if has_3d_annotation:
-                assert len(images_list) == len(depths_list) == len(poses_list)
-
-            current_len = len(images_list)
-
-            for idx, image in enumerate(images_list):
-                view_infos.append(f'{data_scene_name}/{dataset_name}/{this_scene}/{str(idx)}')
-                if has_3d_annotation:
-                    depth_intrinsic = row['depth_intrinsic']
-                    intrinsic = row['intrinsic']
-                    depth_intrinsic_list.append(depth_intrinsic)
-                    intrinsic_list.append(intrinsic)
-                
-
-        dino_meta = {}
-        dino_meta['scene_name'] = data_scene_name
+        all_image_paths = list(row['image_path'])
+        this_scene = row['scene_name']
+        num_imgs = len(all_image_paths)
 
         if has_3d_annotation:
-            if data_scene_name == 'scannet' or data_scene_name == 'structured3d':
-                intric_list = depth_intrinsic_list
+            all_depth_paths = list(row['depth_list'])
+            all_poses = list(row['poses'])
+            assert len(all_image_paths) == len(all_depth_paths) == len(all_poses), \
+                f"Mismatch: images={len(all_image_paths)}, depths={len(all_depth_paths)}, poses={len(all_poses)}"
+            # Intrinsic: per-scene shared value, pick once (not per-view append)
+            if data_scene_name in ['scannet', 'structured3d']:
+                scene_intrinsic = row['depth_intrinsic']
             else:
-                intric_list = intrinsic_list
+                scene_intrinsic = row['intrinsic']
 
-        image_list_copy = deepcopy(images_list)
+        # ── Step 1: Sample view indices (shared across all scenes) ──
+        if num_imgs != self.frame_num:
+            max_distance = 20 if data_scene_name in ['scannet'] else 10
+            idxs = self._sample_view_indices(num_imgs, rng, max_distance=max_distance)
+        else:
+            idxs = list(range(num_imgs))
 
-        # 一些数据集的图片上需要绘制标注
+        # Apply sampling — only for dino branch (frame_num aligned)
+        dino_image_paths = [all_image_paths[i] for i in idxs]
+        dino_view_infos_raw = [f'{data_scene_name}/{dataset_name}/{this_scene}/{i}' for i in idxs]
+
+        # ── Step 2: Load raw data + postprocess for dino branch ──
+        if has_3d_annotation:
+            raw_views = []
+            for j, idx in enumerate(idxs):
+                rgb_image = np.array(Image.open(dino_image_paths[j]).convert("RGB"))
+                depth_path = all_depth_paths[idx]
+                pose = np.vstack(all_poses[idx]).reshape((4, 4))
+                intri = np.vstack(scene_intrinsic).reshape((4, 4))
+
+                depth_map, extri_opencv, intri_opencv, rgb_image = self._load_depth_and_camera(
+                    data_scene_name, depth_path, pose, intri, rgb_image
+                )
+                raw_views.append({
+                    'image': rgb_image,
+                    'depth': depth_map,
+                    'extrinsic': extri_opencv,
+                    'intrinsic': intri_opencv,
+                    'view_info': dino_view_infos_raw[j],
+                })
+
+            # Unified crop/resize postprocessing
+            dino_images, dino_depths, dino_extrinsics, dino_intrinsics, dino_view_infos = \
+                self._postprocess_views(raw_views, rng)
+        else:
+            # No 3D annotation: simple resize
+            dino_images, dino_depths, dino_extrinsics, dino_intrinsics, dino_view_infos = \
+                self._simple_resize_views(dino_image_paths, list(range(len(dino_image_paths))), data_scene_name, this_scene)
+
+        assert len(dino_images) > 0, f"No valid dino images found for scene {this_scene}"
+
+        # ── Step 3: Load VIT images (independent of dino sampling, uses all_image_paths) ──
         vit_images_list = []
         if 'spar' in dataset_name:
             try:
@@ -451,7 +619,7 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         "array": np.array,
                         "object": object,
                         "None": None,
-                        "null": None,  # <-- Add this line to map 'null' to Python's 'None'
+                        "null": None,
                     }
                     metadata = eval(metadata, safe_context)
             
@@ -495,7 +663,7 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                     "nav",
                 }
                 if metadata['type'] in image_types:
-                    for i, img_path in enumerate(images_list):
+                    for i, img_path in enumerate(all_image_paths):
                         try:
                             image = Image.open(img_path).convert("RGB") 
                             self.draw_image(image, metadata)
@@ -503,7 +671,7 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         except Exception as e:
                             error_print_once(e, f"| img_path={img_path} | data_item_id={metadata.get('id', 'unk')}")
                 elif metadata['type'] in images_type:
-                    images = [Image.open(p).convert('RGB') for p in images_list]
+                    images = [Image.open(p).convert('RGB') for p in all_image_paths]
                     self.draw_image(images, metadata)
                     vit_images_list = images
                     
@@ -514,46 +682,71 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 print('row:', row)
                 raw_images = [
                     pil_img2rgb(Image.open(image))
-                    for image in images_list
+                    for image in all_image_paths
                 ]
         else:
             raw_images = [
                     pil_img2rgb(Image.open(image))
-                    for image in images_list
+                    for image in all_image_paths
                 ]
-        
-        # dino分支直接用原始图像
-        raw_images_dino = [
-            np.array(Image.open(image).convert("RGB"))
-                for image in image_list_copy
-        ]
 
+        # ── Step 4: Shuffle view order (dino branch only, vit is independent) ──
+        if self.shuffle_seq_views:
+            indices = list(range(len(dino_images)))
+            self._rng.shuffle(indices)
+            dino_images = [dino_images[i] for i in indices]
+            dino_depths = [dino_depths[i] for i in indices]
+            dino_extrinsics = [dino_extrinsics[i] for i in indices]
+            dino_intrinsics = [dino_intrinsics[i] for i in indices]
+            dino_view_infos = [dino_view_infos[i] for i in indices]
+            dino_image_paths = [dino_image_paths[i] for i in indices]
+
+        # ── Step 5: Build data dict ──
         data = self._init_data()
-        data['img_per_seq'] = len(images_list)
-        print(f"spatial-----img_per_seq = {data['img_per_seq']}")
-        data['image_paths'] = images_list
+        data['img_per_seq'] = len(dino_images)
+        data['image_paths'] = dino_image_paths
 
-        # 不管是否有3D标注构建, 都要加入<dino_image>
-        text_with_images = '<dino_image>'*len(raw_images_dino)+'<vit_image>'*len(raw_images)+question
-        split_list = apply_template_qwenvl2_reconThenUnd(text_with_images, answer)
+        # Build template: dino images + question with vit images
+        num_vit_tokens = question.count('<image>')
+        assert num_vit_tokens == len(raw_images), f"num_vit_tokens={num_vit_tokens}, len(raw_images)={len(raw_images)}"
+
+        text_with_images = question.replace('<image>', '<vit_image>')
+        text_with_images = '<dino_image>' * len(dino_images) + text_with_images
+        split_list = apply_template_qwenvl2_reconThenUnd(text_with_images, answer, task='geo_then_und')
+
+        # Count total dino images for split_start/split_end bi-directional attention
+        total_dino_count = sum(1 for item in split_list if item['type'] == 'dino')
+        dino_counter = 0
+
+        # Prepare per-view queues for _add_image
+        dino_images_queue = list(dino_images)
+        dino_depths_queue = list(dino_depths)
+        dino_extrinsics_queue = list(dino_extrinsics)
+        dino_intrinsics_queue = list(dino_intrinsics)
+        dino_view_infos_queue = list(dino_view_infos)
 
         for item in split_list:
             try:
                 if item['type'] == 'text':
                     data = self._add_text(data, item["value"], need_loss=item['loss'])
                 elif item['type'] == 'dino':
-                    if has_3d_annotation:
-                        depth, depths_list = self.pop_first(depths_list)
-                        pose, poses_list = self.pop_first(poses_list)
-                        intric, intric_list = self.pop_first(intric_list)
-                        
-                        dino_meta['intri'] = np.vstack(intric).reshape((4, 4))
-                        dino_meta['depth'] = depth
-                        dino_meta['pose'] = np.vstack(pose).reshape((4, 4))
-                    else:
-                        this_view_info = None
-                    image, raw_images_dino = self.pop_first(raw_images_dino)
-                    this_view_info, view_infos = self.pop_first(view_infos)
+                    image, dino_images_queue = self.pop_first(dino_images_queue)
+                    depth_map, dino_depths_queue = self.pop_first(dino_depths_queue)
+                    extri, dino_extrinsics_queue = self.pop_first(dino_extrinsics_queue)
+                    intri, dino_intrinsics_queue = self.pop_first(dino_intrinsics_queue)
+                    this_view_info, dino_view_infos_queue = self.pop_first(dino_view_infos_queue)
+
+                    dino_meta = {
+                        'scene_name': data_scene_name,
+                        'depth_map': depth_map,
+                        'extri_opencv': extri,
+                        'intrinsic_': intri,
+                    }
+
+                    # Determine split_start/split_end for bi-directional attention across all dino images
+                    is_split_start = (dino_counter == 0)
+                    is_split_end = (dino_counter == total_dino_count - 1)
+                    dino_counter += 1
                     data = self._add_image(
                         data, 
                         image,
@@ -564,9 +757,12 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         rng=rng,
                         view_info=this_view_info,
                         has_3d_annotation=has_3d_annotation,
+                        split_start=is_split_start,
+                        split_end=is_split_end,
                     )
                 elif item['type'] == 'vit':
                     image, raw_images = self.pop_first(raw_images)
+                    dino_meta = {'scene_name': data_scene_name}
                     data = self._add_image(
                             data, 
                             image,
