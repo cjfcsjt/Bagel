@@ -493,14 +493,14 @@ class Qwen2RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, tag='None'):
         input_dtype = hidden_states.dtype
         
         # === 检查输入 ===
         has_nan_input = torch.isnan(hidden_states).any().item()
         has_inf_input = torch.isinf(hidden_states).any().item()
         if has_nan_input or has_inf_input:
-            print(f"      [RMSNorm] Input: NaN={has_nan_input}, Inf={has_inf_input}, dtype={input_dtype}, min={hidden_states.min():.6e}, max={hidden_states.max():.6e}")
+            print(f"      [RMSNorm-{tag}] Input: NaN={has_nan_input}, Inf={has_inf_input}, dtype={input_dtype}, min={hidden_states.min():.6e}, max={hidden_states.max():.6e}")
         
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -510,7 +510,7 @@ class Qwen2RMSNorm(nn.Module):
         has_inf_var = torch.isinf(variance).any().item()
         has_zero_var = (variance == 0).any().item()
         if has_nan_var or has_inf_var or has_zero_var:
-            print(f"      [RMSNorm] Variance: NaN={has_nan_var}, Inf={has_inf_var}, Zero={has_zero_var}, min={variance.min():.6e}, max={variance.max():.6e}")
+            print(f"      [RMSNorm-{tag}] Variance: NaN={has_nan_var}, Inf={has_inf_var}, Zero={has_zero_var}, min={variance.min():.6e}, max={variance.max():.6e}")
         
         rsqrt_val = torch.rsqrt(variance + self.variance_epsilon)
         

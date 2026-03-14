@@ -534,11 +534,11 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_query_states_ = packed_query_states.new_zeros(packed_query_states.shape)
         packed_key_states_ = packed_key_states.new_zeros(packed_key_states.shape)
 
-        packed_query_states_[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes])
+        packed_query_states_[packed_und_token_indexes] = self.q_norm(packed_query_states[packed_und_token_indexes], 'q_norm')
         if self.config.freeze_und:
             packed_query_states_[packed_und_token_indexes] = packed_query_states_[packed_und_token_indexes].detach()
             
-        packed_query_states_[packed_geo_token_indexes] = self.q_norm_moe_geo(packed_query_states[packed_geo_token_indexes])
+        packed_query_states_[packed_geo_token_indexes] = self.q_norm_moe_geo(packed_query_states[packed_geo_token_indexes], 'q_norm_moe_geo')
         if self.config.freeze_recon:
             packed_query_states_[packed_geo_token_indexes] = packed_query_states_[packed_geo_token_indexes].detach()
 
@@ -547,11 +547,11 @@ class PackedAttentionMoT(Qwen2VLAttention):
         _check_nan_inf(packed_query_states_[packed_geo_token_indexes], "After q_norm_moe_geo (geo)")
         
         
-        packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes])
+        packed_key_states_[packed_und_token_indexes] = self.k_norm(packed_key_states[packed_und_token_indexes], 'k_norm')
         if self.config.freeze_und:
             packed_key_states_[packed_und_token_indexes] = packed_key_states_[packed_und_token_indexes].detach()
             
-        packed_key_states_[packed_geo_token_indexes] = self.k_norm_moe_geo(packed_key_states[packed_geo_token_indexes])
+        packed_key_states_[packed_geo_token_indexes] = self.k_norm_moe_geo(packed_key_states[packed_geo_token_indexes], 'k_norm_moe_geo')
         if self.config.freeze_recon:
             packed_key_states_[packed_geo_token_indexes] = packed_key_states_[packed_geo_token_indexes].detach()
 
@@ -885,7 +885,7 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
         self.freeze_und = config.freeze_und
         self.freeze_recon = config.freeze_recon
 
-        self.layer_scale = config.layer_scale
+        self.layer_scale = True
         if self.layer_scale:
             self.ls1 = LayerScale(config.hidden_size, init_values=0.01)
             self.ls2 = LayerScale(config.hidden_size, init_values=0.01) 
@@ -955,20 +955,20 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
             packed_sequence_[packed_geo_token_indexes] = packed_sequence_[packed_geo_token_indexes].detach()
         
         if self.layer_scale:
-            before = packed_sequence_[packed_geo_token_indexes]
-            print(f"\n=== LayerScale Debug ===")
-            print(f"Before ls1 - min={before.min():.6e}, max={before.max():.6e}, mean={before.mean():.6e}")
-            print(f"Before ls1 - has_nan={torch.isnan(before).any()}, has_inf={torch.isinf(before).any()}")
-            print(f"gamma - min={self.ls1.gamma.min():.6e}, max={self.ls1.gamma.max():.6e}")
-            print(f"gamma - has_nan={torch.isnan(self.ls1.gamma).any()}, has_inf={torch.isinf(self.ls1.gamma).any()}")
-            print(f"gamma - dtype={self.ls1.gamma.dtype}, requires_grad={self.ls1.gamma.requires_grad}")
+            # before = packed_sequence_[packed_geo_token_indexes]
+            # print(f"\n=== LayerScale Debug ===")
+            # print(f"Before ls1 - min={before.min():.6e}, max={before.max():.6e}, mean={before.mean():.6e}")
+            # print(f"Before ls1 - has_nan={torch.isnan(before).any()}, has_inf={torch.isinf(before).any()}")
+            # print(f"gamma - min={self.ls1.gamma.min():.6e}, max={self.ls1.gamma.max():.6e}")
+            # print(f"gamma - has_nan={torch.isnan(self.ls1.gamma).any()}, has_inf={torch.isinf(self.ls1.gamma).any()}")
+            # print(f"gamma - dtype={self.ls1.gamma.dtype}, requires_grad={self.ls1.gamma.requires_grad}")
             
             packed_sequence_[packed_geo_token_indexes] = self.ls1(packed_sequence_[packed_geo_token_indexes])
             
-            after = packed_sequence_[packed_geo_token_indexes]
-            print(f"After ls1 - min={after.min():.6e}, max={after.max():.6e}, mean={after.mean():.6e}")
-            print(f"After ls1 - has_nan={torch.isnan(after).any()}, has_inf={torch.isinf(after).any()}")
-            print(f"======================\n")
+            # after = packed_sequence_[packed_geo_token_indexes]
+            # print(f"After ls1 - min={after.min():.6e}, max={after.max():.6e}, mean={after.mean():.6e}")
+            # print(f"After ls1 - has_nan={torch.isnan(after).any()}, has_inf={torch.isinf(after).any()}")
+            # print(f"======================\n")
        
         packed_sequence = residual + packed_sequence_
 

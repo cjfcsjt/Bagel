@@ -43,9 +43,10 @@ from transformers.image_utils import (
     make_list_of_images,
     to_numpy_array,
     valid_images,
+    VideoInput,
+    make_batched_videos,
     validate_preprocess_arguments,
 )
-from transformers.video_utils import VideoInput, make_batched_videos
 from transformers.utils import TensorType, logging
 
 

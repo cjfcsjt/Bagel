@@ -351,7 +351,7 @@ class G2VLM(PreTrainedModel):
         self.point_head = None
         self.use_dinov3 = config.use_dinov3
         self.ce_loss_dino = config.ce_loss_dino
-
+        self.visual_recon = config.visual_recon
         
         if config.visual_recon:
             self.dino_model = dino_model
@@ -488,8 +488,9 @@ class G2VLM(PreTrainedModel):
             nn.init.zeros_(self.dino2llm.bias)
         if self.use_registers:
             nn.init.normal_(self.register_token, std=1e-6)
-        if self.use_dino_masking:
-            nn.init.trunc_normal_(self.mask_placeholder, mean=0.0, std=0.02, a=-0.04, b=0.04)
+        if self.visual_recon:
+            if self.use_dino_masking:
+                nn.init.trunc_normal_(self.mask_placeholder, mean=0.0, std=0.02, a=-0.04, b=0.04)
 
     # ----------------------
     #  Attention Map Extraction Methods
@@ -688,8 +689,18 @@ class G2VLM(PreTrainedModel):
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
 
+            # === Debug: ViT memory & attention type ===
+            # _vit_mem_before = torch.cuda.memory_allocated() / 1024**3
+            # print(f"[ViT DEBUG] packed_vit_images shape={packed_vit_images.shape}, dtype={packed_vit_images.dtype}", flush=True)
+            # print(f"[ViT DEBUG] packed_image_grid_thw={packed_image_grid_thw.tolist()}", flush=True)
+            # print(f"[ViT DEBUG] vit_token_seqlens={vit_token_seqlens.tolist()}, total_vit_tokens={vit_token_seqlens.sum().item()}", flush=True)
+            # print(f"[ViT DEBUG] GPU mem before ViT forward: {_vit_mem_before:.2f} GB", flush=True)
 
             image_embeds = self.vit_model(packed_vit_images, grid_thw=packed_image_grid_thw)
+
+            # _vit_mem_after = torch.cuda.memory_allocated() / 1024**3
+            # print(f"[ViT DEBUG] GPU mem after ViT forward: {_vit_mem_after:.2f} GB (delta={_vit_mem_after - _vit_mem_before:.2f} GB)", flush=True)
+            # === End debug ===
 
             packed_vit_token_embed = image_embeds
 
@@ -705,7 +716,7 @@ class G2VLM(PreTrainedModel):
 
             BS, C_in, H, W = packed_dino_image_tensor_list.shape # 其中 BS 是所有图像打包在一起的总数（batch × 每个样本的图像数）
         
-            S = img_per_seq_lens[0] #constant for now 每个样本（序列）包含的图像数量。注释 #constant for now 说明当前假设每个样本的图像数相同。
+            S = img_per_seq_lens[0] # constant for now 每个样本（序列）包含的图像数量。注释 #constant for now 说明当前假设每个样本的图像数相同。
             B = BS // S # 反推出 batch size。例如 BS=6, S=3 → B=2，即 2 个样本，每个样本 3 张图
             if self.use_dinov3:
                 patch_h, patch_w = H // 16, W // 16
@@ -750,7 +761,7 @@ class G2VLM(PreTrainedModel):
                 BS, P, D = packed_dino_token_embed.size() #
                 if self.ssl:
                     packed_dino_token_embed, mask = self.random_masking(packed_dino_token_embed, B, S, patch_h, patch_w, mask_mode=self.dino_mask_mode, mask_ratio=self.dino_mask_ratio)
-                    packed_dino_token_embed = packed_dino_token_embed.reshape(BS*P, D)
+                packed_dino_token_embed = packed_dino_token_embed.reshape(BS*P, D)
                 packed_dino_token_embed = self.dino2llm(packed_dino_token_embed) # 768 -> 1536
                 _, D = packed_dino_token_embed.shape
                 packed_dino_token_embed = packed_dino_token_embed.reshape(BS, -1, D) 
@@ -763,7 +774,7 @@ class G2VLM(PreTrainedModel):
                 packed_dino_token_embed = packed_dino_token_embed.reshape(-1, D)
 
                 packed_sequence[packed_dino_token_indexes] = packed_dino_token_embed
-            
+        # assert sequence_length == len(packed_text_indexes) + len(packed_vit_token_indexes) + len(packed_dino_token_indexes)    
         extra_inputs = {}
         if self.use_moe:
             packed_und_token_indexes = packed_text_indexes
@@ -827,83 +838,83 @@ class G2VLM(PreTrainedModel):
                     predictions["mask"] = mask
                     predictions["pred"] = pred
                     predictions["conf"] = conf
-                else:
-                    # 准备GT数据
-                    predictions['world_points'] = batch['world_points']
-                    predictions['point_masks'] = batch['point_masks']
-                    predictions['view_infos'] = batch['view_infos']
-                    predictions['image_paths'] = batch['image_paths']
-                    # 构造 2D 位置编码（RoPE 用）供后续 Transformer 解码器中的 RoPE2D 旋转位置编码使用
-                    if self.use_dinov3:
-                        pos = self.position_getter(B * N, H//16, W//16, hidden.device)
-                    else:
-                        pos = self.position_getter(B * N, H//14, W//14, hidden.device)
-                    if self.patch_start_idx > 0:
+                # else:
+                #     # 准备GT数据
+                #     predictions['world_points'] = batch['world_points']
+                #     predictions['point_masks'] = batch['point_masks']
+                #     predictions['view_infos'] = batch['view_infos']
+                #     predictions['image_paths'] = batch['image_paths']
+                #     # 构造 2D 位置编码（RoPE 用）供后续 Transformer 解码器中的 RoPE2D 旋转位置编码使用
+                #     if self.use_dinov3:
+                #         pos = self.position_getter(B * N, H//16, W//16, hidden.device)
+                #     else:
+                #         pos = self.position_getter(B * N, H//14, W//14, hidden.device)
+                #     if self.patch_start_idx > 0:
                     
-                        pos = pos + 1
-                        pos_special = torch.zeros(B * N, self.patch_start_idx, 2).to(hidden.device).to(pos.dtype)
-                        pos = torch.cat([pos_special, pos], dim=1)
+                #         pos = pos + 1
+                #         pos_special = torch.zeros(B * N, self.patch_start_idx, 2).to(hidden.device).to(pos.dtype)
+                #         pos = torch.cat([pos_special, pos], dim=1)
                 
-                    pos = pos.reshape(B*N, hw, -1)
-                    # 四个解码器并行工作
-                    # point_decoder	point_hidden	解码局部3D点（相机坐标系下）
-                    # conf_decoder	conf_hidden	解码置信度（可选，仅 train_conf_pi3 时）
-                    # camera_decoder	camera_hidden	解码相机位姿
-                    # global_points_decoder	global_point_hidden	解码全局3D点（世界坐标系下）
-                    # 其中 global_points_decoder 是一个 交叉注意力解码器，它用第一个视图的特征作为 context（参考帧），帮助其他视图对齐到全局坐标系
-                    point_hidden = self.point_decoder(hidden, xpos=pos)
-                    if self.train_conf_pi3:
-                        conf_hidden = self.conf_decoder(hidden, xpos=pos)
-                    camera_hidden = self.camera_decoder(hidden, xpos=pos)
-                    if self.use_global_points:
-                        context = hidden.reshape(B, N, patch_h*patch_w+self.patch_start_idx, -1)[:, 0:1].repeat(1, N, 1, 1).reshape(B*N, patch_h*patch_w+self.patch_start_idx, -1)
-                        global_point_hidden = self.global_points_decoder(hidden, context, xpos=pos, ypos=pos)
+                #     pos = pos.reshape(B*N, hw, -1)
+                #     # 四个解码器并行工作
+                #     # point_decoder	point_hidden	解码局部3D点（相机坐标系下）
+                #     # conf_decoder	conf_hidden	解码置信度（可选，仅 train_conf_pi3 时）
+                #     # camera_decoder	camera_hidden	解码相机位姿
+                #     # global_points_decoder	global_point_hidden	解码全局3D点（世界坐标系下）
+                #     # 其中 global_points_decoder 是一个 交叉注意力解码器，它用第一个视图的特征作为 context（参考帧），帮助其他视图对齐到全局坐标系
+                #     point_hidden = self.point_decoder(hidden, xpos=pos)
+                #     if self.train_conf_pi3:
+                #         conf_hidden = self.conf_decoder(hidden, xpos=pos)
+                #     camera_hidden = self.camera_decoder(hidden, xpos=pos)
+                #     if self.use_global_points:
+                #         context = hidden.reshape(B, N, patch_h*patch_w+self.patch_start_idx, -1)[:, 0:1].repeat(1, N, 1, 1).reshape(B*N, patch_h*patch_w+self.patch_start_idx, -1)
+                #         global_point_hidden = self.global_points_decoder(hidden, context, xpos=pos, ypos=pos)
                     
-                    with torch.amp.autocast(device_type='cuda', enabled=False):
-                        # local points
-                        point_hidden = point_hidden.float()
-                        ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-                        xy, z = ret.split([2, 1], dim=-1)
-                        z = torch.exp(z)
-                        local_points = torch.cat([xy * z, z], dim=-1)
+                #     with torch.amp.autocast(device_type='cuda', enabled=False):
+                #         # local points
+                #         point_hidden = point_hidden.float()
+                #         ret = self.point_head([point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                #         xy, z = ret.split([2, 1], dim=-1)
+                #         z = torch.exp(z)
+                #         local_points = torch.cat([xy * z, z], dim=-1)
 
-                        # confidence
-                        if self.train_conf_pi3:
-                            conf_hidden = conf_hidden.float()
-                            conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-                        else:
-                            conf = None
+                #         # confidence
+                #         if self.train_conf_pi3:
+                #             conf_hidden = conf_hidden.float()
+                #             conf = self.conf_head([conf_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                #         else:
+                #             conf = None
                             
-                        # camera
-                        camera_hidden = camera_hidden.float()
-                        camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
+                #         # camera
+                #         camera_hidden = camera_hidden.float()
+                #         camera_poses = self.camera_head(camera_hidden[:, self.patch_start_idx:], patch_h, patch_w).reshape(B, N, 4, 4)
 
-                        # Global points
-                        if self.use_global_points:
-                            global_point_hidden = global_point_hidden.float()
-                            global_points = self.global_point_head([global_point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
-                        else:
-                            global_points = None
-                        # unproject local points using camera poses
-                        points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
+                #         # Global points
+                #         if self.use_global_points:
+                #             global_point_hidden = global_point_hidden.float()
+                #             global_points = self.global_point_head([global_point_hidden[:, self.patch_start_idx:]], (H, W)).reshape(B, N, H, W, -1)
+                #         else:
+                #             global_points = None
+                #         # unproject local points using camera poses
+                #         points = torch.einsum('bnij, bnhwj -> bnhwi', camera_poses, homogenize_points(local_points))[..., :3]
                     
-                    pi3_pred = dict(
-                        points=points,
-                        local_points=local_points,
-                        conf=conf,
-                        camera_poses=camera_poses,
-                        global_points=global_points
-                    )
-                    predictions['points'] = points
-                    predictions['camera_poses'] = camera_poses
-                    predictions['local_points'] = local_points
-                    predictions['global_points'] = global_points
+                #     pi3_pred = dict(
+                #         points=points,
+                #         local_points=local_points,
+                #         conf=conf,
+                #         camera_poses=camera_poses,
+                #         global_points=global_points
+                #     )
+                #     predictions['points'] = points
+                #     predictions['camera_poses'] = camera_poses
+                #     predictions['local_points'] = local_points
+                #     predictions['global_points'] = global_points
 
-                    with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16): 
-                        dl_loss, details = self.Pi3Loss(pi3_pred, batch)
+                #     with torch.amp.autocast("cuda", enabled=True, dtype=torch.bfloat16): 
+                #         dl_loss, details = self.Pi3Loss(pi3_pred, batch)
 
 
-                    predictions["images"] = images_unorm
+                #     predictions["images"] = images_unorm
         # loss 分支 language token ce
         ce = None
         mse = None # 用于visual gen
@@ -912,6 +923,69 @@ class G2VLM(PreTrainedModel):
             packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
 
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none") #note because here it employed 
+
+            # ========== Training-side consistency check ==========
+            if not hasattr(self, '_train_check_counter'):
+                self._train_check_counter = 0
+            self._train_check_counter += 1
+
+            _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if _rank == 0 and self._train_check_counter % 50 == 1:
+                with torch.no_grad():
+                    pred_token_ids = torch.argmax(packed_ce_preds, dim=-1)
+                    num_show = min(30, len(packed_label_ids))
+                    print(f"\n{'='*80}")
+                    print(f"[TRAIN CHECK step={self._train_check_counter}]")
+                    print(f"--- CE Loss ---")
+                    print(f"  Total CE positions: {len(packed_label_ids)}")
+                    print(f"  Label IDs (first {num_show}):     {packed_label_ids[:num_show].tolist()}")
+                    print(f"  Predicted IDs (first {num_show}): {pred_token_ids[:num_show].tolist()}")
+                    match_count = (pred_token_ids[:num_show] == packed_label_ids[:num_show]).sum().item()
+                    print(f"  Match: {match_count}/{num_show}")
+                    print(f"  CE loss (first {num_show}): {[f'{v:.4f}' for v in ce[:num_show].tolist()]}")
+                    print(f"  CE loss mean: {ce.mean().item():.4f}")
+
+                    print(f"\n--- Sequence Structure ---")
+                    print(f"  sequence_length: {sequence_length}")
+                    print(f"  sample_lens: {sample_lens}")
+                    if split_lens is not None:
+                        print(f"  split_lens: {split_lens}")
+                    if attn_modes is not None:
+                        print(f"  attn_modes: {attn_modes}")
+                    print(f"  packed_text_ids count: {len(packed_text_ids)}")
+                    print(f"  packed_text_ids (first 50): {packed_text_ids[:50].tolist()}")
+                    print(f"  packed_text_indexes (first 50): {packed_text_indexes[:50].tolist()}")
+                    print(f"  ce_loss_indexes count: {len(ce_loss_indexes)}")
+                    print(f"  ce_loss_indexes (first 30): {ce_loss_indexes[:30].tolist()}")
+
+                    print(f"\n--- Position IDs ---")
+                    print(f"  packed_position_ids shape: {packed_position_ids.shape}")
+                    print(f"  packed_position_ids range: [{packed_position_ids.min().item()}, {packed_position_ids.max().item()}]")
+                    print(f"  packed_position_ids[0] (first 50): {packed_position_ids[0, :50].tolist()}")
+
+                    if dino_token_seqlens is not None:
+                        print(f"\n--- DINO Info ---")
+                        print(f"  dino_token_seqlens: {dino_token_seqlens.tolist()}")
+                        print(f"  packed_dino_token_indexes count: {len(packed_dino_token_indexes)}")
+                        print(f"  packed_dino_token_indexes (first 20): {packed_dino_token_indexes[:20].tolist()}")
+                        if packed_dino_image_tensor_list is not None:
+                            print(f"  DINO image tensor shape: {packed_dino_image_tensor_list.shape}")
+                            print(f"  DINO image pixel range: [{packed_dino_image_tensor_list.min().item():.4f}, {packed_dino_image_tensor_list.max().item():.4f}]")
+                            print(f"  DINO image mean: {packed_dino_image_tensor_list.mean().item():.4f}")
+                            print(f"  DINO image std: {packed_dino_image_tensor_list.std().item():.4f}")
+                            print(f"  DINO image per-channel mean: {packed_dino_image_tensor_list.mean(dim=[0,2,3]).tolist()}")
+                        if img_per_seq_lens is not None:
+                            print(f"  img_per_seq_lens: {img_per_seq_lens}")
+
+                    if packed_vit_token_indexes is not None:
+                        print(f"\n--- VIT Info ---")
+                        print(f"  vit_token_seqlens: {vit_token_seqlens.tolist() if vit_token_seqlens is not None else 'None'}")
+                        print(f"  packed_vit_token_indexes count: {len(packed_vit_token_indexes)}")
+                        if packed_vit_images is not None:
+                            print(f"  VIT image shape: {packed_vit_images.shape}")
+
+                    print(f"{'='*80}\n")
+            # ========== End of training-side check ==========
 
         
         if vggt_loss_dict is not None:
