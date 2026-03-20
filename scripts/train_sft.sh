@@ -31,7 +31,7 @@ export NCCL_BLOCKING_WAIT=1
 # export NCCL_NET_PLUGIN=none
 export NCCL_IB_HCA="mlx5_0"
 export NCCL_P2P_LEVEL="NVL"
-
+RUNID=102
 # replace the variables with your own
 torchrun \
   --nnodes=1 \
@@ -59,16 +59,16 @@ torchrun \
   --dino_num_ref -1 \
   --max_num_tokens 50000 \
   --expected_num_tokens 50000 \
-  --max_num_tokens_per_sample 15000 \
+  --max_num_tokens_per_sample 25000 \
   --num_shard 8 \
   --cpu_offload False \
   --use_flex True \
   --resume_from None \
   --results_dir ./results \
-  --checkpoint_dir $HOME/code/ckpt/joint_geo_then_und \
+  --checkpoint_dir $HOME/code/ckpt/joint_geo_then_und_dual_${RUNID} \
   --save_every 200 \
   --log_every 1 \
   --lr 2e-5 \
   --max_latent_size 64  \
-  --wandb_runid 93 \
+  --wandb_runid ${RUNID} \
   --num_workers 2 # use small num_workers since the num_used_data (10) are not enough to split
