@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import math
+import random
 from typing import List, Tuple, Optional, Dict, Any
 
 import torch
@@ -24,6 +26,115 @@ from modeling.cache_utils.taylorseer import cache_init
 from tqdm import tqdm
 
 
+def generate_connected_masks(
+    B: int,
+    V: int,
+    H: int,
+    W: int,
+    ratio: float,
+    device=None,
+    dtype=torch.uint8,
+    ar_range=(0.3, 3.0),
+    mode: str = "rectangle"
+) -> torch.Tensor:
+    """
+    Generate connected masks for masking image patches.
+    Returns: (B, V, H, W), 1=masked, 0=visible.
+    """
+    device = device or "cpu"
+    mask = torch.zeros(B, V, H, W, device=device, dtype=dtype)
+    r = ratio
+
+    if mode == "rectangle":
+        total = H * W
+        for b in range(B):
+            for v in range(V):
+                target_area = max(1, int(round(r * total)))
+                log_min, log_max = math.log(ar_range[0]), math.log(ar_range[1])
+                ar = math.exp(torch.empty(()).uniform_(log_min, log_max).item())
+                h = max(1, int(round(math.sqrt(target_area / ar))))
+                w = max(1, int(round(ar * h)))
+                h = max(1, min(h, H))
+                w = max(1, min(w, W))
+                top = 0 if H == h else int(torch.randint(0, H - h + 1, (1,)).item())
+                left = 0 if W == w else int(torch.randint(0, W - w + 1, (1,)).item())
+                mask[b, v, top:top+h, left:left+w] = 1
+
+    elif mode == "random_walk":
+        from collections import deque
+        for b in range(B):
+            for v in range(V):
+                target = max(1, int(round(r * H * W)))
+                visited = torch.zeros((H, W), device=device, dtype=torch.bool)
+                y = int(torch.randint(0, H, (1,)).item())
+                x = int(torch.randint(0, W, (1,)).item())
+                q = deque()
+                q.append((y, x))
+                visited[y, x] = True
+                filled = 0
+                while q and filled < target:
+                    cy, cx = q.popleft()
+                    mask[b, v, cy, cx] = 1
+                    filled += 1
+                    if filled >= target:
+                        break
+                    dirs = [(1,0),(-1,0),(0,1),(0,-1)]
+                    idx = torch.randperm(4)
+                    for i in idx.tolist():
+                        dy, dx = dirs[i]
+                        ny, nx = cy + dy, cx + dx
+                        if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            q.append((ny, nx))
+
+    elif mode == "ellipse":
+        total = H * W
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device),
+            torch.arange(W, device=device), indexing="ij"
+        )
+        for b in range(B):
+            for v in range(V):
+                target_area = max(1, int(round(r * total)))
+                base_r = math.sqrt(target_area / math.pi)
+                ar = math.exp(torch.empty(()).uniform_(
+                    math.log(ar_range[0]), math.log(ar_range[1])
+                ).item())
+                ry = max(1, int(round(base_r / math.sqrt(ar))))
+                rx = max(1, int(round(base_r * math.sqrt(ar))))
+                ry, rx = min(ry, H//2), min(rx, W//2)
+                cy = int(torch.randint(ry, max(ry+1, H - ry), (1,)).item()) if H - 2*ry > 0 else H // 2
+                cx = int(torch.randint(rx, max(rx+1, W - rx), (1,)).item()) if W - 2*rx > 0 else W // 2
+                ellipse = ((yy - cy)**2 / (ry**2 + 1e-6) + (xx - cx)**2 / (rx**2 + 1e-6)) <= 1
+                mask[b, v] = ellipse.to(dtype)
+
+    elif mode == "blob":
+        smooth_k = 10
+        total = H * W
+        target = max(1, int(round(r * total)))
+        noise = torch.randn(B*V, 1, H, W, device=device)
+        kernel_size = min(smooth_k, H, W)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        smoothed = torch.nn.functional.avg_pool2d(noise, kernel_size, stride=1, padding=kernel_size//2)
+        flat = smoothed.view(B*V, -1)
+        kth = torch.topk(flat, target, dim=-1).values.min(dim=-1, keepdim=True).values
+        mask = (flat >= kth).view(B, V, H, W)
+
+    elif mode == "random":
+        total = H * W
+        target = max(1, int(round(r * total)))
+        noise = torch.randn(B*V, 1, H, W, device=device)
+        flat = noise.view(B*V, -1)
+        kth = torch.topk(flat, target, dim=-1).values.min(dim=-1, keepdim=True).values
+        mask = (flat >= kth).view(B, V, H, W)
+
+    else:
+        raise ValueError(f"Unknown mask mode: {mode}")
+
+    return mask.to(dtype)
+
+
 class BagelConfig(PretrainedConfig):
     def __init__(
         self,
@@ -38,6 +149,9 @@ class BagelConfig(PretrainedConfig):
         connector_act="gelu_pytorch_tanh",
         interpolate_pos=False,
         timestep_shift=1.0,
+        use_masking=False,
+        mask_mode=None,
+        mask_ratio=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -52,6 +166,9 @@ class BagelConfig(PretrainedConfig):
         self.connector_act = connector_act
         self.interpolate_pos = interpolate_pos
         self.timestep_shift = timestep_shift
+        self.use_masking = use_masking
+        self.mask_mode = mask_mode if mask_mode is not None else ['random']
+        self.mask_ratio = mask_ratio if mask_ratio is not None else [0.75]
 
 
 class Bagel(PreTrainedModel):
@@ -77,6 +194,15 @@ class Bagel(PreTrainedModel):
             self.llm2vae = nn.Linear(self.hidden_size, self.patch_latent_dim)
             self.latent_pos_embed = PositionEmbedding(self.max_latent_size, self.hidden_size)
 
+            # Masked reconstruction support
+            self.use_masking = config.use_masking
+            self.mask_mode = config.mask_mode
+            self.mask_ratio = config.mask_ratio
+            if self.use_masking:
+                # Learnable placeholder embedding for masked positions in nonref clean VAE tokens.
+                # Note: nonref images have no VIT (excluded at data side), so no VIT placeholder needed.
+                self.vae_mask_placeholder = nn.Parameter(torch.zeros(self.hidden_size))
+
         if config.visual_und:
             self.vit_model = vit_model
             self.vit_patch_size = config.vit_config.patch_size
@@ -97,6 +223,8 @@ class Bagel(PreTrainedModel):
         if self.config.visual_gen:
             nn.init.constant_(self.llm2vae.weight, 0)
             nn.init.constant_(self.llm2vae.bias, 0)
+            if self.use_masking:
+                nn.init.normal_(self.vae_mask_placeholder, std=0.02)
 
     def forward(
         self,
@@ -122,6 +250,7 @@ class Bagel(PreTrainedModel):
         packed_vae_token_indexes: Optional[torch.LongTensor] = None,
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
+        packed_vae_types: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -187,14 +316,162 @@ class Bagel(PreTrainedModel):
                 packed_latent.append(latent)
             packed_latent_clean = torch.cat(packed_latent, dim=0)
 
-            noise = torch.randn_like(packed_latent_clean)
-            packed_timesteps = torch.sigmoid(packed_timesteps)
-            packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
-            packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
-            packed_timestep_embeds = self.time_embedder(packed_timesteps)
-            latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
-            packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
-            packed_sequence[packed_vae_token_indexes] = packed_latent
+            if self.use_masking and packed_vae_types is not None:
+                # === Masked Reconstruction Mode ===
+                #
+                # Data layout uses explicit vae_type labels from the dataset:
+                #   "ref"          — ref clean VAE (Pass 1 ref images, no loss)
+                #   "nonref_clean" — nonref clean VAE (Pass 1 nonref images, no loss)
+                #   "nonref_noise" — nonref noise VAE (Pass 2 nonref images, with loss)
+                #
+                # Strategy:
+                # 1. Classify VAE images by packed_vae_types labels
+                # 2. Generate spatial masks for each nonref image
+                # 3. Noise VAE: fully noised via flow-matching (entire image, not just masked)
+                #    — the model sees visible parts through the nonref clean VAE condition
+                # 4. Nonref clean VAE: replace masked positions with vae_mask_placeholder
+                #
+                # Note: nonref images have NO VIT tokens (removed at data side to prevent
+                # information leakage). Only ref images have VIT tokens.
+
+                i = random.randint(0, len(self.mask_mode) - 1)
+                cur_mode = self.mask_mode[i]
+                cur_ratio = self.mask_ratio[i]
+
+                # --- Step 1: Classify VAE images by explicit vae_type labels ---
+                # Each entry: (vae_index, h, w, token_offset)
+                ref_vae_list = []          # vae_type == "ref"
+                nonref_clean_vae_list = [] # vae_type == "nonref_clean"
+                noise_vae_list = []        # vae_type == "nonref_noise"
+                token_offset = 0
+                for vae_idx, (h, w) in enumerate(patchified_vae_latent_shapes):
+                    num_tokens = h * w
+                    # All tokens of one VAE image share the same vae_type
+                    vae_type = packed_vae_types[token_offset]
+                    entry = (vae_idx, h, w, token_offset)
+                    if vae_type == "ref":
+                        ref_vae_list.append(entry)
+                    elif vae_type == "nonref_clean":
+                        nonref_clean_vae_list.append(entry)
+                    elif vae_type == "nonref_noise":
+                        noise_vae_list.append(entry)
+                    else:
+                        raise ValueError(f"Unknown vae_type: {vae_type!r}. "
+                                        f"Expected 'ref', 'nonref_clean', or 'nonref_noise'.") 
+                    token_offset += num_tokens
+
+                num_nonref = len(noise_vae_list)
+                num_ref = len(ref_vae_list)
+
+                assert len(nonref_clean_vae_list) == num_nonref, (
+                    f"nonref_clean ({len(nonref_clean_vae_list)}) and nonref_noise ({num_nonref}) "
+                    f"count mismatch — each nonref image must have exactly one clean and one noise entry."
+                )
+                for i in range(num_nonref):
+                    _, hc, wc, _ = nonref_clean_vae_list[i]
+                    _, hn, wn, _ = noise_vae_list[i]
+                    assert (hc, wc) == (hn, wn), (
+                        f"nonref image {i}: clean shape ({hc},{wc}) != noise shape ({hn},{wn})"
+                    )
+
+                # --- Step 2: Generate masks for each nonref image ---
+                # masks_2d[i]: (h, w) binary mask for nonref image i, 1=masked
+                masks_2d = []
+                for i in range(num_nonref):
+                    _, h, w, _ = noise_vae_list[i]
+                    mask = generate_connected_masks(
+                        B=1, V=1, H=h, W=w,
+                        ratio=cur_ratio,
+                        device=packed_latent_clean.device,
+                        dtype=torch.uint8,
+                        mode=cur_mode,
+                    )  # (1, 1, h, w)
+                    masks_2d.append(mask.squeeze(0).squeeze(0))  # (h, w)
+
+                # --- Step 3: Build noise VAE flag (all tokens of noise images) ---
+                # Noise VAE tokens are fully noised — no per-patch masking needed,
+                # because the nonref clean VAE already provides visible patches as condition.
+                packed_noise_vae_flags = torch.zeros(
+                    packed_latent_clean.shape[0], dtype=torch.bool,
+                    device=packed_latent_clean.device
+                )
+                for i in range(num_nonref):
+                    _, h, w, offset = noise_vae_list[i]
+                    num_tokens = h * w
+                    packed_noise_vae_flags[offset:offset + num_tokens] = True
+
+                # --- Step 4: Build mask flags for nonref clean VAE tokens ---
+                packed_clean_vae_mask_flags = torch.zeros(
+                    packed_latent_clean.shape[0], dtype=torch.bool,
+                    device=packed_latent_clean.device
+                )
+                for i in range(num_nonref):
+                    _, h, w, offset = nonref_clean_vae_list[i]
+                    num_tokens = h * w
+                    mask_flat = masks_2d[i].flatten().bool()
+                    packed_clean_vae_mask_flags[offset:offset + num_tokens] = mask_flat
+
+                # --- Step 4b: Build mask flags for noise VAE tokens (masked positions only) ---
+                # This marks which tokens *within* the noise VAE correspond to masked patches.
+                # Used later to filter loss computation to masked positions only.
+                packed_noise_vae_mask_flags = torch.zeros(
+                    packed_latent_clean.shape[0], dtype=torch.bool,
+                    device=packed_latent_clean.device
+                )
+                for i in range(num_nonref):
+                    _, h, w, offset = noise_vae_list[i]
+                    num_tokens = h * w
+                    mask_flat = masks_2d[i].flatten().bool()
+                    packed_noise_vae_mask_flags[offset:offset + num_tokens] = mask_flat
+
+                # --- Step 5: Process noise VAE tokens (fully noised via flow-matching) ---
+                # Each noise image independently samples its own timestep.
+                packed_latent_input = packed_latent_clean.clone()
+                noise = torch.randn_like(packed_latent_clean)
+
+                per_token_timesteps = torch.zeros(
+                    packed_latent_clean.shape[0], device=packed_latent_clean.device
+                )
+
+                for i in range(num_nonref):
+                    _, h, w, offset = noise_vae_list[i]
+                    num_tokens = h * w
+
+                    # Sample an independent timestep for this noise image
+                    raw_t = torch.randn(1, device=packed_latent_clean.device)
+                    sampled_t = torch.sigmoid(raw_t)
+                    sampled_t = self.timestep_shift * sampled_t / (1 + (self.timestep_shift - 1) * sampled_t)
+                    sampled_t = sampled_t.item()
+
+                    # x_t = (1 - t) * clean + t * noise
+                    packed_latent_input[offset:offset + num_tokens] = (
+                        (1 - sampled_t) * packed_latent_clean[offset:offset + num_tokens]
+                        + sampled_t * noise[offset:offset + num_tokens]
+                    )
+                    per_token_timesteps[offset:offset + num_tokens] = sampled_t
+
+                packed_timestep_embeds = self.time_embedder(per_token_timesteps)
+                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
+                packed_latent_embedded = self.vae2llm(packed_latent_input) + packed_timestep_embeds + latent_token_pos_emb
+
+                # --- Step 6: Replace masked positions in nonref clean VAE with placeholder ---
+                packed_latent_embedded[packed_clean_vae_mask_flags] = self.vae_mask_placeholder
+
+                packed_sequence[packed_vae_token_indexes] = packed_latent_embedded
+
+                # NOTE: Nonref images have NO VIT tokens — this is enforced at the data side
+                # (need_vit=False for nonref images in MaskedReconIterableDataset).
+                # Only ref images have VIT, preventing information leakage of masked regions.
+            else:
+                # === Original Flow-Matching Mode ===
+                noise = torch.randn_like(packed_latent_clean)
+                packed_timesteps = torch.sigmoid(packed_timesteps)
+                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
+                packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
+                packed_timestep_embeds = self.time_embedder(packed_timesteps)
+                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
+                packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
+                packed_sequence[packed_vae_token_indexes] = packed_latent
 
         extra_inputs = {}
         if self.use_moe:
@@ -216,10 +493,37 @@ class Bagel(PreTrainedModel):
 
         mse = None
         if self.config.visual_gen:
-            packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-            target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
-            has_mse = packed_timesteps > 0
-            mse = (packed_mse_preds - target[has_mse]) ** 2
+            if self.use_masking and packed_vae_types is not None:
+                # === Masked Reconstruction Loss (masked positions only) ===
+                # Compute loss only on MASKED tokens of noise VAE images.
+                # The entire noise VAE is flow-matched, but we only supervise masked patches.
+                #
+                # mse_loss_indexes selects all noise VAE tokens in packed_sequence space.
+                # We then further filter by noise_internal_mask_flags to keep only masked ones.
+
+                # Step 1: Get predictions for ALL noise VAE tokens
+                all_noise_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
+
+                # Step 2: Build internal mask to select masked positions within noise VAE tokens
+                # packed_noise_vae_mask_flags marks masked positions in packed_latent space;
+                # packed_noise_vae_flags marks all noise VAE positions in packed_latent space.
+                # We need the mask relative to noise-only tokens.
+                noise_internal_mask_flags = packed_noise_vae_mask_flags[packed_noise_vae_flags]
+
+                # Step 3: Filter to masked positions only
+                masked_preds = all_noise_preds[noise_internal_mask_flags]
+
+                # Step 4: Velocity target only at masked positions
+                velocity_target_all = noise[packed_noise_vae_flags] - packed_latent_clean[packed_noise_vae_flags]
+                velocity_target = velocity_target_all[noise_internal_mask_flags]
+
+                mse = (masked_preds - velocity_target) ** 2
+            else:
+                # === Original Flow-Matching Loss ===
+                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
+                target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
+                has_mse = packed_timesteps > 0
+                mse = (packed_mse_preds - target[has_mse]) ** 2
 
         ce = None
         if ce_loss_indexes is not None:
