@@ -569,35 +569,64 @@ class G2VLM(PreTrainedModel):
                 layer.self_attn._saved_query_states = None
                 layer.self_attn._saved_key_states = None
 
-    def random_masking(self, x, B, V, Hp, Wp, mask_mode, mask_ratio):
+    def random_masking(self, x, B, V, Hp, Wp, mask_mode, mask_ratio, repeat_masks=None, ref_masks=None):
         """
         Perform per-sample random masking by per-sample shuffling.
         Masked tokens are replaced with a learnable mask_placeholder.
-        x: [B, V, L, D], sequence (batch, views, spatial tokens, dim)
+        x: [B*V, L, D], sequence (batch*views, spatial tokens, dim)
         Hp: patch height
         Wp: patch width
+        repeat_masks: [B, V] bool tensor, True=repeated view (excluded from loss)
+        ref_masks: [B, V] bool tensor, True=ref view (no masking, determined at dataset side)
+        
+        Returns:
+            x: [B*V, L, D] with masked tokens replaced by mask_placeholder
+            mask: [B, V, L], 0=keep, 1=masked (for loss computation)
         """
         BV, L, C = x.shape
         x = x.reshape(B, V, L, C)
-        # 随机选择mask模式和比例
+        # Randomly select mask mode and ratio
         i = random.randint(0, len(mask_mode) - 1)
         mode, ratio = mask_mode[i], mask_ratio[i]
-        # 确定参考视图的数量
-        if self.num_ref >= 0:
-            num_ref = self.num_ref # 固定参考视图数量
+
+        if repeat_masks is not None and ref_masks is not None and ref_masks.any():
+            # ── repeat_masks + ref_masks aware masking (dataset-side ref allocation) ──
+            # Both masks are (B, V) bool tensors determined at dataset side.
+            #
+            # Strategy: generate reconstruction masks for ALL V views, then
+            #   - ref views (ref_mask=True): zero out mask (fully visible, no masking)
+            #   - non-ref views (including repeated non-ref): keep the generated mask
+            #     * repeated non-ref views participate in masking but their loss is
+            #       ignored downstream via repeat_masks
+            #
+            # This avoids computing num_valid_nonref and the per-view assembly loop.
+            
+            #  对所有 V 个 view 都生成 mask
+            mask = generate_connected_masks(B, V, Hp, Wp, ratio=ratio,
+                                            device=x.device, dtype=torch.float32,
+                                            mode=mode)
+            mask = mask.flatten(2, 3)  # (B, V, Hp*Wp)
+            # Zero out ref views (no masking for reference views)
+            # ref_masks: (B, V) -> (B, V, 1), broadcast over L
+            mask = mask * (~ref_masks).unsqueeze(-1).float() # ref view 的 mask 置 0，不遮挡
         else:
-            num_ref = random.randint(V // 4, V // 2) # 随机选择 V/4 ~ V/2个参考视图
+            # ── Original logic (no repeat_masks / ref_masks) ──
+            if self.num_ref >= 0:
+                num_ref = self.num_ref
+            else:
+                num_ref = random.randint(V // 4, V // 2)
 
-        # Generate masks only for non-reference views, 只针对非参考视图生成mask
-        mask = generate_connected_masks(B, V - num_ref, Hp, Wp, ratio=ratio,
-                                        device=x.device, dtype=torch.float32,
-                                        mode=mode)
-        mask = mask.flatten(2, 3)  # (B, V-num_ref, Hp*Wp)
-        # Prepend zeros for reference views (no masking) 参考视图的 mask 全为 0
-        mask = torch.cat((torch.zeros(B, num_ref, L, device=x.device), mask), dim=1) # 1代表mask 0代表没有mask
+            # Generate masks only for non-reference views
+            mask = generate_connected_masks(B, V - num_ref, Hp, Wp, ratio=ratio,
+                                            device=x.device, dtype=torch.float32,
+                                            mode=mode)
+            mask = mask.flatten(2, 3)  # (B, V-num_ref, Hp*Wp)
+            # Prepend zeros for reference views (no masking)
+            # non-ref view (包括 repeat 的) 保留生成的 mask
+            mask = torch.cat((torch.zeros(B, num_ref, L, device=x.device), mask), dim=1)
 
-        # Replace masked tokens with learnable mask_placeholder, 用占位符替换被 mask 的 token
-        x = torch.where(mask.unsqueeze(-1) > 0.5, self.mask_placeholder, x)
+        # Replace masked tokens with learnable mask_placeholder
+        x = torch.where(mask.unsqueeze(-1) > 0.5, self.mask_placeholder, x) # condition 为 True → 取 mask-placeholder；False → 取原 token
         x = x.reshape(B*V, L, C)
         return x, mask
 
@@ -635,6 +664,8 @@ class G2VLM(PreTrainedModel):
         packed_cam_points: Optional[torch.Tensor] = None,
         packed_world_points: Optional[torch.Tensor] = None,
         packed_point_masks: Optional[torch.Tensor] = None,
+        packed_repeat_masks: Optional[torch.Tensor] = None,
+        packed_ref_masks: Optional[torch.Tensor] = None,
         img_per_seq_lens: Optional[torch.Tensor] = None,
         query_points: Optional[torch.Tensor] = None,
         packed_view_infos=None, 
@@ -737,6 +768,10 @@ class G2VLM(PreTrainedModel):
                 # batch['cam_points'] = packed_cam_points.reshape(B, S, *packed_cam_points.shape[1:])
                 batch['world_points'] = packed_world_points.reshape(B, S, *packed_world_points.shape[1:]).to(torch.float32)
                 batch['point_masks'] = packed_point_masks.reshape(B, S, *packed_point_masks.shape[1:])
+                if packed_repeat_masks is not None:
+                    batch['repeat_masks'] = packed_repeat_masks.reshape(B, S)
+                if packed_ref_masks is not None:
+                    batch['ref_masks'] = packed_ref_masks.reshape(B, S)
                 batch['images'] = images_unorm
                 batch['view_infos'] = packed_view_infos
                 batch['image_paths'] = packed_image_paths
@@ -760,7 +795,14 @@ class G2VLM(PreTrainedModel):
 
                 BS, P, D = packed_dino_token_embed.size() #
                 if self.ssl:
-                    packed_dino_token_embed, mask = self.random_masking(packed_dino_token_embed, B, S, patch_h, patch_w, mask_mode=self.dino_mask_mode, mask_ratio=self.dino_mask_ratio)
+                    # Pass repeat_masks and ref_masks to random_masking for aware masking
+                    _repeat_masks = batch.get('repeat_masks', None)
+                    _ref_masks = batch.get('ref_masks', None)
+                    packed_dino_token_embed, mask = self.random_masking(
+                        packed_dino_token_embed, B, S, patch_h, patch_w,
+                        mask_mode=self.dino_mask_mode, mask_ratio=self.dino_mask_ratio,
+                        repeat_masks=_repeat_masks, ref_masks=_ref_masks,
+                    )
                 packed_dino_token_embed = packed_dino_token_embed.reshape(BS*P, D)
                 packed_dino_token_embed = self.dino2llm(packed_dino_token_embed) # 768 -> 1536
                 _, D = packed_dino_token_embed.shape
@@ -833,7 +875,8 @@ class G2VLM(PreTrainedModel):
                     # reshape from (B*S, L, p²×3) to (B, S, L, p²×3) to match ConfLoss expectation
                     pred = pred.reshape(B, S, *pred.shape[1:])
                     conf = conf.reshape(B, S, *conf.shape[1:])
-                    ssl_loss, details = self.conf_loss(images_unorm, pred, conf, mask)
+                    ssl_loss, details = self.conf_loss(images_unorm, pred, conf, mask, 
+                                                       repeat_masks=batch.get('repeat_masks', None))
                     predictions["images"] = images_unorm
                     predictions["mask"] = mask
                     predictions["pred"] = pred

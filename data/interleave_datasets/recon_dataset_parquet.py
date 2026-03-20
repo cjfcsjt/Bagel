@@ -72,6 +72,7 @@ class ReconParquetIterableDataset(ParquetStandardIterableDataset, DistributedIte
         self.random_aspect_ratio = 1.0
         self.resolution = [518, 518]
         self.shuffle_seq_views = True
+        self.num_ref = -1  # -1 means random; >=0 means fixed num_ref (synced with model's dino_num_ref)
 
     # ────────────────────────── Setters ──────────────────────────
 
@@ -220,6 +221,8 @@ class ReconParquetIterableDataset(ParquetStandardIterableDataset, DistributedIte
             'new_depths': [],
             'view_infos': [],
             'image_paths': [],
+            'repeat_mask': [],
+            'ref_mask': [],
         }
         return data
 
@@ -581,146 +584,197 @@ class ReconParquetIterableDataset(ParquetStandardIterableDataset, DistributedIte
         """
         Parse a single row from the Parquet dataset.
 
-        Expected row format (same as the JSONL format from recon_dataset.py):
-            - scene_name: str (e.g., 'blendmvs', 'scannet')
-            - seq_name: str
-            - img_dir: str (path to scene directory)
-            - num_images: int
+        Pipeline:
+            Step 1: Sample to fixed size (frame_num) → fix_size_view_ids
+                    This guarantees dino tensors can be reshaped to (frame_num, ...).
+            Step 2: Shuffle fix_size_view_ids, build repeat_mask (which frames are duplicated).
+            Step 3: From non-repeat frames, take first num_ref as ref views.
+                    Build ref_mask based on view_id (all positions sharing a ref view_id are True).
+            Step 4: VIT images = non-repeat ref views only (variable count, no reshape needed).
+                    DINO images = all frame_num views (fixed count, for reshape).
+            Step 5: Assemble template and build data dict.
+
+        Two masks (both length = frame_num, aligned with dino views):
+            - repeat_mask: True = this view_id already appeared at an earlier position (2nd+ occurrence)
+            - ref_mask:    True = this position's view_id is one of the ref view_ids
+                           (includes both first and repeated occurrences of the ref view_id)
 
         Returns:
             data: dict with all processed data for this sample
         """
         rng = self._rng
         data_scene_name = row['scene_name']
-        # this_scene = row['seq_name']
         this_scene = row['image_path'][0].split('/')[-2]
         has_3d_annotation = (
             'depth_list' in row and row['depth_list'] is not None and len(row.get('depth_list', [])) > 0 and
             'poses' in row and row['poses'] is not None and len(row.get('poses', [])) > 0
         )
-        
-        # Convert row to dict for scene loading methods
+
         data_item = {
             'scene_name': data_scene_name,
-            # 'seq_name': this_scene,
-            # 'img_dir': row.get('img_dir', ''),
-            'num_images':  len(row['image_path']),
+            'num_images': len(row['image_path']),
         }
 
-        # ── 1. Load views based on scene type ──
-        images = []
-        depths = []
-        extrinsics = []
-        intrinsics = []
-        view_infos = []
-        image_paths = []
-
+        # ══════════════════════════════════════════════════════════════════
+        # Step 1: Sample to fixed size (frame_num) → fix_size_view_ids
+        #   The view_ids may contain duplicates when num_available < frame_num.
+        # ══════════════════════════════════════════════════════════════════
         if has_3d_annotation:
-            # Step 1a: Get scene metadata (view names, total count, paths)
             if data_scene_name == 'blendmvs':
                 scene_info = self._get_blendmvs_scene_info(data_item)
-                max_distance = 10  # scene-specific max_distance for sampling
+                max_distance = 10
             elif data_scene_name == 'scannet':
-                # TODO: Add scannet scene info loading
-                # scene_info = self._get_scannet_scene_info(data_item)
-                # max_distance = 20
                 return []
             else:
                 raise ValueError(f"Unsupported scene type: {data_scene_name}")
 
-            # Step 1b: Sample view indices (shared across all scenes)
             num_scene_imgs = scene_info['num_imgs']
             if num_scene_imgs != self.frame_num:
-                idxs = self._sample_view_indices(num_scene_imgs, rng, max_distance=max_distance)
+                fix_size_view_ids = self._sample_view_indices(num_scene_imgs, rng, max_distance=max_distance)
             else:
-                idxs = list(range(num_scene_imgs))
+                fix_size_view_ids = list(range(num_scene_imgs))
 
-            # Step 1c: Load raw data by indices (scene-specific I/O only)
+            # Load raw data for sampled indices
             if data_scene_name == 'blendmvs':
-                raw_views = self._load_blendmvs_raw(data_item, scene_info, idxs)
+                raw_views = self._load_blendmvs_raw(data_item, scene_info, fix_size_view_ids)
             elif data_scene_name == 'scannet':
-                # raw_views = self._load_scannet_raw(data_item, scene_info, idxs)
                 return []
 
-            # Step 1d: Crop/resize postprocessing (shared across all scenes)
+            # Crop/resize postprocessing
             images, depths, extrinsics, intrinsics, view_infos = self._postprocess_views(raw_views, rng)
+            image_paths = list(view_infos)  # use view_infos as path identifiers for 3D scenes
 
         else:
-            # No 3D annotation: use shared sampling + simple resize
-            # Expect row to have 'image_paths' or derive from img_dir
-            # img_dir = row.get('img_dir', '')
-            num_images = len(row['image_path'])
-
-            # Discover available images in the directory
             all_image_paths = list(row['image_path'])
-
             if len(all_image_paths) == 0:
                 return []
 
-            # Reuse the same sampling strategy
             num_avail = len(all_image_paths)
             if num_avail != self.frame_num:
-                idxs = self._sample_view_indices(num_avail, rng, max_distance=10)
+                fix_size_view_ids = self._sample_view_indices(num_avail, rng, max_distance=10)
             else:
-                idxs = list(range(num_avail))
+                fix_size_view_ids = list(range(num_avail))
+
             images, depths, extrinsics, intrinsics, view_infos = self._simple_resize_views(
-                all_image_paths, idxs, data_scene_name, this_scene
+                all_image_paths, fix_size_view_ids, data_scene_name, this_scene
             )
-            # Keep only sampled paths (must match dino_image count in pack_sequence)
-            image_paths = [all_image_paths[i] for i in idxs]
+            image_paths = [all_image_paths[i] for i in fix_size_view_ids]
 
         if len(images) == 0:
             return []
 
-        # ── 2. Shuffle view order ──
-        if self.shuffle_seq_views:
-            indices = list(range(len(images)))
-            self._rng.shuffle(indices)
-            images = [images[i] for i in indices]
-            depths = [depths[i] for i in indices]
-            extrinsics = [extrinsics[i] for i in indices]
-            intrinsics = [intrinsics[i] for i in indices]
-            view_infos = [view_infos[i] for i in indices]
-            assert len(image_paths) == len(images)
-            image_paths = [image_paths[i] for i in indices]
+        assert len(images) == self.frame_num, (
+            f"Expected {self.frame_num} images after sampling, got {len(images)}"
+        )
 
-        # ── 3. Build data dict using modular methods ──
+        # ══════════════════════════════════════════════════════════════════
+        # Step 2: Build repeat_mask, then shuffle everything together
+        #   repeat_mask[i] = True means fix_size_view_ids[i] already appeared
+        #   at an earlier position (i.e. this is the 2nd+ occurrence).
+        # ══════════════════════════════════════════════════════════════════
+        seen = set()
+        repeat_mask = []
+        for vid in fix_size_view_ids:
+            if vid in seen:
+                repeat_mask.append(True)
+            else:
+                repeat_mask.append(False)
+                seen.add(vid)
+
+        if self.shuffle_seq_views:
+            perm = list(range(self.frame_num))
+            self._rng.shuffle(perm)
+            fix_size_view_ids = [fix_size_view_ids[i] for i in perm]
+            images       = [images[i] for i in perm]
+            depths       = [depths[i] for i in perm]
+            extrinsics   = [extrinsics[i] for i in perm]
+            intrinsics   = [intrinsics[i] for i in perm]
+            view_infos   = [view_infos[i] for i in perm]
+            image_paths  = [image_paths[i] for i in perm]
+            repeat_mask  = [repeat_mask[i] for i in perm]
+
+        # ══════════════════════════════════════════════════════════════════
+        # Step 3: Determine ref views from non-repeat frames
+        #   - non_repeat_indices: positions in the (shuffled) array where repeat_mask=False
+        #   - Take the first num_ref of them as ref views
+        #   - Collect the view_ids of ref views → ref_view_id_set
+        #   - ref_mask[i] = True if fix_size_view_ids[i] is a ref view_id
+        #     (this includes BOTH first and repeated occurrences of that view_id)
+        # ══════════════════════════════════════════════════════════════════
+        non_repeat_indices = [i for i, r in enumerate(repeat_mask) if not r]
+        num_non_repeat = len(non_repeat_indices)
+
+        if self.num_ref >= 0:
+            num_ref = min(self.num_ref, num_non_repeat)
+        else:
+            num_ref = self._rng.integers(max(1, num_non_repeat // 4), max(2, num_non_repeat // 2 + 1))
+            num_ref = min(num_ref, num_non_repeat)
+
+        # Collect the view_ids chosen as ref (from the first num_ref non-repeat positions)
+        ref_view_id_set = set(fix_size_view_ids[pos] for pos in non_repeat_indices[:num_ref])
+        # ref_mask: True for ALL positions whose view_id is in ref_view_id_set
+        # (includes repeated occurrences of ref view_ids)
+        ref_mask = [(fix_size_view_ids[i] in ref_view_id_set) for i in range(self.frame_num)]
+
+        # ══════════════════════════════════════════════════════════════════
+        # Step 4: Prepare VIT images (non-repeat ref only) and DINO images (all frame_num)
+        #   - VIT: only non-repeat ref views (no need to encode duplicates with VIT)
+        #   - DINO: fixed count (= frame_num), will be reshaped to (B, S, ...)
+        # ══════════════════════════════════════════════════════════════════
+        ref_vit_images = [images[pos] for pos in non_repeat_indices[:num_ref]]
+        # dino uses all `images` in order (length = frame_num)
+
+        # ══════════════════════════════════════════════════════════════════
+        # Step 5: Build data dict and assemble template
+        # ══════════════════════════════════════════════════════════════════
         data = self._init_data()
         data['img_per_seq'] = self.frame_num
-        # image_paths: for has_3d_annotation=True, use view_infos as paths;
-        # for has_3d_annotation=False, image_paths was set from row['image_path'] sampled subset
-        if len(image_paths) == 0:
-            # Fallback: use view_infos as image identifiers
-            image_paths = list(view_infos)
         data['image_paths'] = image_paths
+        data['repeat_mask'] = repeat_mask  # len = frame_num
+        data['ref_mask'] = ref_mask        # len = frame_num
 
-        # Build template: text prompt + dino images
-        text_with_images = '<dino_image>' * len(images)
+        # Template: <vit_image> * num_ref  +  <dino_image> * frame_num
+        # VIT tokens come first so dino reconstruction can attend back to them
+        text_with_images = '<vit_image>' * num_ref + '<dino_image>' * self.frame_num
         task = 'geo'
         answer = ''
         split_list = apply_template_qwenvl2_reconThenUnd(text_with_images, answer, task)
 
-        # Count total dino images for split_start/split_end bi-directional attention
+        # Count dino images for split_start / split_end (bi-directional attention boundary)
         total_dino_count = sum(1 for item in split_list if item['type'] == 'dino')
         dino_counter = 0
 
-        # Prepare per-view metadata for _add_image
-        images_queue = list(images)
-        depths_queue = list(depths)
-        extrinsics_queue = list(extrinsics)
-        intrinsics_queue = list(intrinsics)
-        view_infos_queue = list(view_infos)
+        # Queues: pop in order as we iterate through split_list
+        vit_queue = list(ref_vit_images)                   # length = num_ref
+        dino_img_queue = list(images)                      # length = frame_num
+        dino_depth_queue = list(depths)                    # length = frame_num
+        dino_extri_queue = list(extrinsics)                # length = frame_num
+        dino_intri_queue = list(intrinsics)                # length = frame_num
+        dino_vinfo_queue = list(view_infos)                # length = frame_num
 
         for item in split_list:
             try:
                 if item['type'] == 'text':
                     data = self._add_text(data, item["value"], need_loss=item['loss'])
+
+                elif item['type'] == 'vit':
+                    vit_image, vit_queue = self.pop_first(vit_queue)
+                    dino_meta = {'scene_name': data_scene_name}
+                    data = self._add_image(
+                        data,
+                        vit_image,
+                        dino_meta=dino_meta,
+                        need_loss=False,
+                        need_dino=False,
+                        need_vit=True,
+                    )
+
                 elif item['type'] == 'dino':
-                    image, images_queue = self.pop_first(images_queue)
-                    depth_map, depths_queue = self.pop_first(depths_queue)
-                    extri, extrinsics_queue = self.pop_first(extrinsics_queue)
-                    intri, intrinsics_queue = self.pop_first(intrinsics_queue)
-                    this_view_info, view_infos_queue = self.pop_first(view_infos_queue)
+                    image, dino_img_queue = self.pop_first(dino_img_queue)
+                    depth_map, dino_depth_queue = self.pop_first(dino_depth_queue)
+                    extri, dino_extri_queue = self.pop_first(dino_extri_queue)
+                    intri, dino_intri_queue = self.pop_first(dino_intri_queue)
+                    this_view_info, dino_vinfo_queue = self.pop_first(dino_vinfo_queue)
 
                     dino_meta = {
                         'scene_name': data_scene_name,
@@ -729,7 +783,6 @@ class ReconParquetIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         'intrinsic_': intri,
                     }
 
-                    # Determine split_start/split_end for bi-directional attention
                     is_split_start = (dino_counter == 0)
                     is_split_end = (dino_counter == total_dino_count - 1)
                     dino_counter += 1
@@ -747,6 +800,7 @@ class ReconParquetIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         split_start=is_split_start,
                         split_end=is_split_end,
                     )
+
             except AssertionError as e:
                 print(e, 'skipping')
                 return []
