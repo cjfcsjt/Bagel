@@ -39,6 +39,7 @@ class DataConfig:
         dino_patch_size=14,
         vit_max_num_patch_per_side=70,
         dino_max_num_patch_per_side=37,
+        num_query_tokens=64,
     ):
         self.grouped_datasets = grouped_datasets
         self.text_cond_dropout_prob = text_cond_dropout_prob
@@ -49,6 +50,7 @@ class DataConfig:
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.dino_max_num_patch_per_side = dino_max_num_patch_per_side
         self.max_latent_size = max_latent_size
+        self.num_query_tokens = num_query_tokens
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -63,6 +65,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         expected_num_tokens=32768, 
         max_num_tokens_per_sample=16384,
         max_num_tokens=36864,
+        max_pass1_tokens=36864,
         prefer_buffer_before=16384,
         max_buffer_size=50,
         interpolate_pos=False,
@@ -74,6 +77,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self.max_num_tokens_per_sample = max_num_tokens_per_sample
         self.prefer_buffer_before = prefer_buffer_before
         self.max_num_tokens = max_num_tokens
+        self.max_pass1_tokens = max_pass1_tokens
         self.max_buffer_size = max_buffer_size
         self.tokenizer = tokenizer
         self.local_rank = local_rank
@@ -225,6 +229,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
             packed_point_masks          = list(),
             packed_view_infos           = list(),
             packed_image_paths           = list(),
+            packed_repeat_masks          = list(),
+            packed_ref_masks                = list(),
             packed_dino_image_tensor_list    = list(),
             packed_image_grid_thw       = list(),
 
@@ -233,6 +239,23 @@ class PackedDataset(torch.utils.data.IterableDataset):
             vit_token_seqlens           = list(),
             packed_vit_token_indexes    = list(), 
             img_per_seq_lens            = list(), 
+            qformer_token_indexes       = list(),
+
+            # ===== Pass1 fields for recon-for-und =====
+            # Pass1 is the frozen encoder pass with dino + system/instruction/question
+            pass1_curr                      = 0,
+            pass1_sample_lens               = list(),
+            pass1_packed_position_ids       = list(),
+            pass1_split_lens                = list(),
+            pass1_attn_modes                = list(),
+            pass1_packed_text_ids           = list(),
+            pass1_packed_text_indexes       = list(),
+            pass1_packed_dino_token_indexes = list(),
+            pass1_dino_token_seqlens        = list(),
+            pass1_dino_grid_thw             = list(),
+            pass1_question_text_indexes     = list(),
+            pass1_question_text_lengths     = list(),
+            pass1_dino_images_per_sample    = list(),
         )
         return sequence_status
 
@@ -260,7 +283,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         
         if len(sequence_status['packed_dino_image_tensor_list']) > 0: 
 
-            data['packed_dino_token_indexes'] = torch.tensor(sequence_status['packed_dino_token_indexes'])
+            data['packed_dino_token_indexes'] = torch.tensor(sequence_status['packed_dino_token_indexes'], dtype=torch.long)
             data['dino_token_seqlens'] = torch.tensor(sequence_status['dino_token_seqlens'])
 
 
@@ -297,6 +320,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['img_per_seq_lens'] = sequence_status['img_per_seq_lens']
             data['packed_view_infos'] = sequence_status["packed_view_infos"]
             data['packed_image_paths'] = sequence_status["packed_image_paths"]
+            if 'packed_repeat_masks' in sequence_status.keys():
+                data['packed_repeat_masks'] = torch.tensor(sequence_status["packed_repeat_masks"], dtype=torch.bool)
+                data['packed_ref_masks'] = torch.tensor(sequence_status["packed_ref_masks"], dtype=torch.bool)
             
 
         if len(sequence_status['packed_vit_images']) > 0:
@@ -310,6 +336,37 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['packed_label_ids'] = torch.tensor(sequence_status['packed_label_ids'])
             data['ce_loss_indexes'] = torch.tensor(sequence_status['ce_loss_indexes'])
             data['ce_loss_weights'] = torch.tensor(sequence_status['ce_loss_weights'])
+
+        # ===== Pass1 data for recon-for-und =====
+        if len(sequence_status['pass1_packed_text_ids']) > 0:
+            pass1_seq_len = sum(sequence_status['pass1_sample_lens'])
+            data['pass1_sequence_length'] = pass1_seq_len
+            pass1_position_ids = torch.cat(sequence_status['pass1_packed_position_ids'], dim=1)
+
+            # Pad pass1 to max_pass1_tokens (must be multiple of 128 for Triton compatibility)
+            pass1_pad_len = self.max_pass1_tokens - pass1_seq_len
+            if pass1_pad_len > 0:
+                data['pass1_split_lens'] = sequence_status['pass1_split_lens'] + [pass1_pad_len]
+                data['pass1_attn_modes'] = sequence_status['pass1_attn_modes'] + ['causal']
+                data['pass1_sample_lens'] = sequence_status['pass1_sample_lens'] + [pass1_pad_len]
+            else:
+                # pass1_seq_len >= max_pass1_tokens, no padding needed
+                data['pass1_split_lens'] = sequence_status['pass1_split_lens']
+                data['pass1_attn_modes'] = sequence_status['pass1_attn_modes']
+                data['pass1_sample_lens'] = sequence_status['pass1_sample_lens']
+
+            data['pass1_packed_text_ids'] = torch.tensor(sequence_status['pass1_packed_text_ids'])
+            data['pass1_packed_text_indexes'] = torch.tensor(sequence_status['pass1_packed_text_indexes'])
+            data['pass1_packed_position_ids'] = pass1_position_ids
+            data['pass1_packed_dino_token_indexes'] = torch.tensor(sequence_status['pass1_packed_dino_token_indexes'], dtype=torch.long)
+            data['pass1_dino_token_seqlens'] = torch.tensor(sequence_status['pass1_dino_token_seqlens'])
+            data['pass1_dino_grid_thw'] = torch.stack(sequence_status['pass1_dino_grid_thw'])
+            data['pass1_question_text_indexes'] = torch.tensor(sequence_status['pass1_question_text_indexes'])
+            data['pass1_question_text_lengths'] = sequence_status['pass1_question_text_lengths']
+            data['pass1_dino_images_per_sample'] = sequence_status['pass1_dino_images_per_sample']
+
+        if len(sequence_status['qformer_token_indexes']) > 0:
+            data['qformer_token_indexes'] = torch.tensor(sequence_status['qformer_token_indexes'], dtype=torch.long)
 
         return data
 
@@ -371,10 +428,16 @@ class PackedDataset(torch.utils.data.IterableDataset):
                                 
                             if sample is None:
                                 continue
-                            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan']) # 样本本身的 token 数量，包括文本 token 和图像 token（vit 或 dino）等内容 token, 为 sequence_plan 中的每个 item 额外预留 2 个 token
+                            # Handle both tuple (recon-for-und) and dict samples
+                            if isinstance(sample, tuple):
+                                s1, s2 = sample
+                                num_tokens = s1['num_tokens'] + s2['num_tokens'] + 2 * (len(s1['sequence_plan']) + len(s2['sequence_plan']))
+                            else:
+                                num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
                             if num_tokens < self.max_num_tokens_per_sample:
                                 sequence_status = self.pack_sequence(sample, sequence_status)
-                                batch_data_indexes.append(sample['data_indexes'])
+                                _data_idx = sample[0].get('data_indexes', {}) if isinstance(sample, tuple) else sample.get('data_indexes', {})
+                                batch_data_indexes.append(_data_idx)
                                 print(f"    Added mandatory sample: {num_tokens} tokens, curr={sequence_status['curr']}")
                                 break
                             else:
@@ -391,7 +454,12 @@ class PackedDataset(torch.utils.data.IterableDataset):
             sample = next(self.dataset_iters[group_index][0])
             # 数据的长度，等待加入
             
-            num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
+            # Handle both tuple (recon-for-und) and dict samples
+            if isinstance(sample, tuple):
+                s1, s2 = sample
+                num_tokens = s1['num_tokens'] + s2['num_tokens'] + 2 * (len(s1['sequence_plan']) + len(s2['sequence_plan']))
+            else:
+                num_tokens = sample['num_tokens'] + 2 * len(sample['sequence_plan'])
             # 1. 单样本检查 - 太长的样本直接跳过
             if num_tokens > self.max_num_tokens_per_sample:
                 print(f"[Rank {self.local_rank} Worker ] skip a sample with length {num_tokens}")
@@ -412,7 +480,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
             
             # 如果没有超过硬上限，就会被加入
             sequence_status = self.pack_sequence(sample, sequence_status)
-            batch_data_indexes.append(sample['data_indexes'])
+            _data_idx = sample[0].get('data_indexes', {}) if isinstance(sample, tuple) else sample.get('data_indexes', {})
+            batch_data_indexes.append(_data_idx)
 
             # 3. 软目标检查 - 添加后检查，达到目标即返回
             if sequence_status['curr'] >= self.expected_num_tokens:
@@ -426,6 +495,18 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 batch_data_indexes = []
 
     def pack_sequence(self, sample, sequence_status):
+        # ===== Recon-for-und: tuple input (data_pass1, data_pass2) =====
+        if isinstance(sample, tuple):
+            data_pass1, data_pass2 = sample
+            # Pack pass1 into sequence_status (frozen encoder pass)
+            self._pack_pass1_sequence(data_pass1, sequence_status)
+            # Pack pass2 into sequence_status (trainable pass)
+            self._pack_pass2_sequence(data_pass2, sequence_status)
+            # sequence_status['curr'] += sequence_status['pass1_curr']
+            # sequence_status['sample_lens'] += sequence_status['pass1_sample_lens']
+            return sequence_status
+
+        # ===== Standard single-sample packing (original logic) =====
         if 'image_tensor_list' in sample:
             image_tensor_list = sample['image_tensor_list']
         if 'image_grid_thw_list' in sample: 
@@ -448,7 +529,11 @@ class PackedDataset(torch.utils.data.IterableDataset):
             view_infos =sample['view_infos']
         if 'image_paths' in sample:
             image_paths =sample['image_paths']
-        if 'img_per_seq' in sample: 
+        if 'repeat_mask' in sample:
+            repeat_mask_list = sample['repeat_mask']
+        if 'ref_mask' in sample:
+            ref_mask_list = sample['ref_mask']
+        if 'img_per_seq' in sample:
             img_per_seq = sample['img_per_seq']
         if 'dino_image_tensor_list' in sample: 
             dino_image_tensor_list = sample['dino_image_tensor_list']
@@ -456,6 +541,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
             dino_images = sample['dino_images']
         if 'dino_thw' in sample: 
             dino_thw = sample['dino_thw']
+        if 'img_per_seq' in sample:
+            img_per_seq = sample['img_per_seq']
 
         split_lens, attn_modes = list(), list()
         curr = sequence_status['curr']
@@ -582,7 +669,20 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 sequence_status["packed_point_masks"].append(point_masks_np)  
                 sequence_status["packed_view_infos"].append(view_info_str)  
                 sequence_status["packed_image_paths"].append(image_path_str)  
-                sequence_status["packed_dino_image_tensor_list"].append(dino_image)  
+
+                if 'repeat_mask' in sample:
+                    repeat_flag = repeat_mask_list.pop(0)
+                else:
+                    repeat_flag = False
+                sequence_status["packed_repeat_masks"].append(repeat_flag)
+
+                if 'ref_mask' in sample:
+                    ref_flag = ref_mask_list.pop(0)
+                else:
+                    ref_flag = False
+                sequence_status["packed_ref_masks"].append(ref_flag)
+
+                sequence_status["packed_dino_image_tensor_list"].append(dino_image)
 
                 sequence_status['packed_text_ids'].append(self.start_of_image)
                 sequence_status['packed_text_indexes'].append(curr)
@@ -653,7 +753,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
             # split_lens = [L1, L2, L3, L4, L_q, L_a]
             # attn_modes = ["full", "full", "full", "full", "causal", "causal"]
             # → dino_1 看不到 dino_2/3/4，dino_2 看不到 dino_3/4 ...
-            # 修改后（所有 DINO 图像合并为一个 split）：
+            # 修改后（所有 DINO 图像合并为一个 split):
             # split_lens = [L1+L2+L3+L4, L_q, L_a]
             # attn_modes = ["full", "causal", "causal"] 
             # → 所有 DINO 图像的 token 在一个 "full" split 中互相双向可见
@@ -679,6 +779,322 @@ class PackedDataset(torch.utils.data.IterableDataset):
             sequence_status['attn_modes'].extend(attn_modes)
 
         return sequence_status
+
+    def _pack_pass1_sequence(self, sample, sequence_status):
+        """
+        Build the pass1 packed sequence for recon-for-und.
+        
+        sample is an independent data_pass1 dict with its own:
+        - sequence_plan: items of type 'text' and 'dino_image'
+        - text_ids_list: text token ids
+        - dino_image_tensor_list, dino_thw: dino image data
+        
+        Pass1 is used for the frozen encoder forward to extract dino hidden states
+        and question text hidden states for the Q-Former.
+        """
+        sequence_plan = sample['sequence_plan']
+        text_ids_list = list(sample['text_ids_list'])
+        dino_thw_list = list(sample.get('dino_thw', []))
+        dino_image_tensor_list = list(sample.get('dino_image_tensor_list', []))
+        dino_images = sample['dino_images']
+
+        if 'depths' in sample:
+            depth_array =sample['depths']
+        if 'extrinsics' in sample:
+            extrinsics_array =sample['extrinsics']
+        if 'intrinsics' in sample:
+            intrinsics_array =sample['intrinsics']
+        if 'world_points' in sample:
+            world_points_array =sample['world_points']
+        if 'point_masks' in sample:
+            point_masks_array =sample['point_masks']
+        if 'view_infos' in sample:
+            view_infos =sample['view_infos']
+        if 'image_paths' in sample:
+            image_paths =sample['image_paths']
+        if 'img_per_seq' in sample:
+            img_per_seq = sample['img_per_seq']
+        
+        if not sequence_plan:
+            return
+
+        pass1_split_lens, pass1_attn_modes = list(), list()
+        curr = sequence_status['pass1_curr']
+        curr_rope_id = 0
+        pass1_sample_lens = 0
+        sample_question_text_total = 0  # Accumulate total question text length for this sample
+        sample_dino_count = 0  # Count dino images for this sample
+
+        for item in sequence_plan:
+            split_start = item.get('split_start', True)
+            if split_start:
+                curr_split_len = 0
+
+            if item['type'] == 'text':
+                text_ids = text_ids_list.pop(0)
+                sequence_status['pass1_packed_text_ids'].extend(text_ids)
+                sequence_status['pass1_packed_text_indexes'].extend(range(curr, curr + len(text_ids)))
+
+                # Track question text indexes and lengths for Q-Former
+                role = item.get('role', '')
+                if role == 'question':
+                    sequence_status['pass1_question_text_indexes'].extend(
+                        range(curr, curr + len(text_ids))
+                    )
+                    sample_question_text_total += len(text_ids)
+
+                curr += len(text_ids)
+                curr_split_len += len(text_ids)
+
+                pos_ids = torch.tensor(range(curr_rope_id, curr_rope_id + curr_split_len), dtype=torch.long).expand(3, -1),
+                sequence_status['pass1_packed_position_ids'].extend(pos_ids)
+                curr_rope_id += curr_split_len
+
+            elif item['type'] == 'dino_image':
+                sample_dino_count += 1
+                use_registers = False
+                use_camera_token = False 
+
+
+                dino_image_thw = dino_thw_list.pop(0)
+                image_tensor = dino_image_tensor_list.pop(0)
+                dino_image = dino_images.pop(0)
+                depths_np = depth_array.pop(0)
+                extrinsics_np = extrinsics_array.pop(0)
+                intrinsics_np = intrinsics_array.pop(0)
+                world_points_np  = world_points_array.pop(0)
+                point_masks_np = point_masks_array.pop(0)    
+                if 'view_infos' in sample:
+                    view_info_str = view_infos.pop(0)
+                else:
+                    view_info_str = ''
+                    
+                if 'image_paths' in sample:
+                    image_path_str = image_paths.pop(0)
+                else:
+                    image_path_str = ''
+                sequence_status["packed_depths"].append(depths_np)               
+                sequence_status["packed_extrinsics"].append(extrinsics_np)  
+                sequence_status["packed_intrinsics"].append(intrinsics_np)  
+                sequence_status["packed_world_points"].append(world_points_np)  
+                sequence_status["packed_point_masks"].append(point_masks_np)  
+                sequence_status["packed_view_infos"].append(view_info_str)  
+                sequence_status["packed_image_paths"].append(image_path_str)  
+
+
+                sequence_status["packed_dino_image_tensor_list"].append(dino_image)
+                
+                # <|vision_start|> token
+                sequence_status['pass1_packed_text_ids'].append(self.start_of_image)
+                sequence_status['pass1_packed_text_indexes'].append(curr)
+                curr += 1
+                curr_split_len += 1
+
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['pass1_packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+                if use_camera_token:
+                    pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                    sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                    curr_rope_id += 1 
+
+                if use_registers:
+                    for _ in range(4):
+                        pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                        sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                        curr_rope_id += 1
+
+                # preprocess image
+                dino_tokens = patchify(image_tensor, self.data_config.dino_patch_size)
+                num_img_tokens = dino_tokens.shape[0]
+
+                if use_registers:
+                    sequence_status['pass1_packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens +1 + 4))
+                    curr += num_img_tokens + 1 + 4
+                    curr_split_len += num_img_tokens + 1 +4 
+                elif use_camera_token:
+                    sequence_status['pass1_packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens + 1))
+                    curr += num_img_tokens + 1 
+                    curr_split_len += num_img_tokens + 1
+                else:
+                    sequence_status['pass1_packed_dino_token_indexes'].extend(range(curr, curr + num_img_tokens ))
+                    curr += num_img_tokens 
+                    curr_split_len += num_img_tokens 
+
+                sequence_status['pass1_dino_token_seqlens'].append(num_img_tokens)
+                sequence_status['pass1_dino_grid_thw'].append(dino_image_thw) # 用于q-former
+
+                postions_ids_from_dino_for_rope, rope_deltas = get_rope_index_image_3D_dino(
+                    dino_image_thw,
+                    curr_rope_id,
+                    device=image_tensor.device
+                )
+                sequence_status['pass1_packed_position_ids'].extend([postions_ids_from_dino_for_rope])
+                curr_rope_id += rope_deltas + 1
+
+                # <|endofimage|> token
+                sequence_status['pass1_packed_text_ids'].append(self.end_of_image)
+                sequence_status['pass1_packed_text_indexes'].append(curr)
+                curr += 1
+                curr_split_len += 1
+
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['pass1_packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+            if item.get('split_end', True):
+                if item['type'] in ('dino_image',):
+                    pass1_attn_modes.append('full')
+                else:
+                    pass1_attn_modes.append('causal')
+                pass1_split_lens.append(curr_split_len)
+                pass1_sample_lens += curr_split_len
+
+        sequence_status['pass1_curr'] = curr
+        sequence_status['pass1_sample_lens'].append(pass1_sample_lens)
+        sequence_status["img_per_seq_lens"].append(img_per_seq)
+        sequence_status['pass1_split_lens'].extend(pass1_split_lens)
+        sequence_status['pass1_attn_modes'].extend(pass1_attn_modes)
+        # Append per-sample aggregated info for Q-Former
+        if sample_question_text_total > 0:
+            sequence_status['pass1_question_text_lengths'].append(sample_question_text_total)
+        sequence_status['pass1_dino_images_per_sample'].append(sample_dino_count)
+
+    def _pack_pass2_sequence(self, sample, sequence_status):
+        """
+        Build the pass2 packed sequence for recon-for-und.
+        
+        sample is an independent data_pass2 dict with its own:
+        - sequence_plan: items of type 'text', 'vit_image', 'qformer_placeholder'
+        - text_ids_list: text token ids
+        - image_tensor_list, image_grid_thw_list: vit image data
+        
+        Pass2 is the trainable forward pass. Key items:
+        - 'text': question and answer text tokens
+        - 'vit_image': vit image tokens  
+        - 'qformer_placeholder': placeholder positions for Q-Former output tokens
+          (replacing the original dino images with num_query_tokens compressed tokens)
+        """
+        sequence_plan = sample['sequence_plan']
+        text_ids_list = list(sample['text_ids_list'])
+
+        if not sequence_plan:
+            return
+
+        num_query_tokens = self.data_config.num_query_tokens
+
+        image_tensor_list = list(sample.get('image_tensor_list', []))
+        image_grid_thw_list = list(sample.get('image_grid_thw_list', []))
+
+        split_lens, attn_modes = list(), list()
+        curr = sequence_status['curr']
+        curr_rope_id = 0
+        sample_lens = 0
+
+        for item in sequence_plan:
+            split_start = item.get('split_start', True)
+            if split_start:
+                curr_split_len = 0
+
+            if item['type'] == 'text':
+                text_ids = text_ids_list.pop(0)
+                sequence_status['packed_text_ids'].extend(text_ids)
+                sequence_status['packed_text_indexes'].extend(range(curr, curr + len(text_ids)))
+
+                # Answer text has loss
+                if item.get('loss', 0) == 1:
+                    sequence_status['ce_loss_indexes'].extend(range(curr, curr + len(text_ids)))
+                    sequence_status['ce_loss_weights'].extend(
+                        [len2weight(len(text_ids))] * len(text_ids)
+                    )
+                    sequence_status['packed_label_ids'].extend(text_ids[1:] + [self.eos_token_id])
+
+                curr += len(text_ids)
+                curr_split_len += len(text_ids)
+
+                if item.get('loss', 0) == 1:
+                    sequence_status['packed_text_ids'].append(self.eos_token_id)
+                    sequence_status['packed_text_indexes'].append(curr)
+                    curr += 1
+                    curr_split_len += 1
+
+                pos_ids = torch.tensor(range(curr_rope_id, curr_rope_id + curr_split_len), dtype=torch.long).expand(3, -1),
+                sequence_status['packed_position_ids'].extend(pos_ids)
+                curr_rope_id += curr_split_len
+
+            elif item['type'] == 'vit_image':
+                image_tensor = image_tensor_list.pop(0)
+                image_grid_thw = image_grid_thw_list.pop(0)
+
+                # <|vision_start|> token
+                sequence_status['packed_text_ids'].append(self.start_of_image)
+                sequence_status['packed_text_indexes'].append(curr)
+                curr += 1
+                curr_split_len += 1
+
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+                num_img_tokens = image_tensor.shape[0] // 4
+                sequence_status['packed_vit_token_indexes'].extend(range(curr, curr + num_img_tokens))
+                curr += num_img_tokens
+                curr_split_len += num_img_tokens
+                sequence_status['vit_token_seqlens'].append(num_img_tokens)
+
+                # Also add vit data to main sequence fields for unified encoding
+                sequence_status['packed_vit_images'].append(image_tensor)
+                sequence_status['packed_image_grid_thw'].append(image_grid_thw)
+
+                postions_ids_from_vit_for_rope, rope_deltas = get_rope_index_image_3D(
+                    image_grid_thw,
+                    curr_rope_id,
+                    device=image_tensor.device
+                )
+                sequence_status['packed_position_ids'].extend([postions_ids_from_vit_for_rope])
+                curr_rope_id += rope_deltas + 1
+
+                # <|endofimage|> token
+                sequence_status['packed_text_ids'].append(self.end_of_image)
+                sequence_status['packed_text_indexes'].append(curr)
+                curr += 1
+                curr_split_len += 1
+
+                pos_tensor = torch.full((1,), curr_rope_id, dtype=torch.long)
+                sequence_status['packed_position_ids'].extend([pos_tensor.expand(3, 1)])
+                curr_rope_id += 1
+
+            elif item['type'] == 'qformer_placeholder':
+                # Q-Former output token placeholders (replacing original dino images)
+
+                # qformer output token placeholders
+                sequence_status['qformer_token_indexes'].extend(
+                    range(curr, curr + num_query_tokens)
+                )
+                curr += num_query_tokens
+                curr_split_len += num_query_tokens
+
+                # Use 1D position ids for qformer tokens (no spatial structure)
+                qformer_pos_ids = torch.tensor(
+                    range(curr_rope_id, curr_rope_id + num_query_tokens),
+                    dtype=torch.long
+                ).expand(3, -1)
+                sequence_status['packed_position_ids'].extend([qformer_pos_ids])
+                curr_rope_id += num_query_tokens
+
+            if item.get('split_end', True):
+                if item['type'] in ('qformer_placeholder', 'vit_image'):
+                    attn_modes.append('full')
+                else:
+                    attn_modes.append('causal')
+                split_lens.append(curr_split_len)
+                sample_lens += curr_split_len
+        assert sum(split_lens) == sample_lens
+        sequence_status['curr'] = curr
+        sequence_status['sample_lens'].append(sample_lens)
+        sequence_status['split_lens'].extend(split_lens)
+        sequence_status['attn_modes'].extend(attn_modes)
 
 class SimpleCustomBatch:
     def __init__(self, batch):
@@ -709,6 +1125,8 @@ class SimpleCustomBatch:
             self.packed_world_points =  data["packed_world_points"]
             self.packed_point_masks = data["packed_point_masks"] 
             self.packed_dino_image_tensor_list = data["packed_dino_image_tensor_list"]
+            self.packed_repeat_masks = data["packed_repeat_masks"]
+            self.packed_ref_masks = data["packed_ref_masks"]
             self.img_per_seq_lens = data["img_per_seq_lens"]
             self.packed_view_infos = data['packed_view_infos']
             self.packed_image_paths = data['packed_image_paths']
@@ -723,6 +1141,25 @@ class SimpleCustomBatch:
             self.packed_label_ids = data["packed_label_ids"]
             self.ce_loss_indexes = data["ce_loss_indexes"]
             self.ce_loss_weights = data["ce_loss_weights"]
+
+        # ===== Pass1 fields for recon-for-und =====
+        if "pass1_sequence_length" in data.keys():
+            self.pass1_sequence_length = data["pass1_sequence_length"]
+            self.pass1_sample_lens = data["pass1_sample_lens"]
+            self.pass1_packed_text_ids = data["pass1_packed_text_ids"]
+            self.pass1_packed_text_indexes = data["pass1_packed_text_indexes"]
+            self.pass1_packed_position_ids = data["pass1_packed_position_ids"]
+            self.pass1_split_lens = data["pass1_split_lens"]
+            self.pass1_attn_modes = data["pass1_attn_modes"]
+            self.pass1_packed_dino_token_indexes = data["pass1_packed_dino_token_indexes"]
+            self.pass1_dino_token_seqlens = data["pass1_dino_token_seqlens"]
+            self.pass1_dino_grid_thw = data["pass1_dino_grid_thw"]
+            self.pass1_question_text_indexes = data["pass1_question_text_indexes"]
+            self.pass1_question_text_lengths = data["pass1_question_text_lengths"]
+            self.pass1_dino_images_per_sample = data["pass1_dino_images_per_sample"]
+
+        if "qformer_token_indexes" in data.keys():
+            self.qformer_token_indexes = data["qformer_token_indexes"]
 
     def pin_memory(self):
         self.packed_text_ids = self.packed_text_ids.pin_memory()
@@ -742,6 +1179,8 @@ class SimpleCustomBatch:
             self.packed_world_points =  self.packed_world_points.pin_memory()  
             self.packed_point_masks = self.packed_point_masks.pin_memory()  
             self.packed_dino_image_tensor_list = self.packed_dino_image_tensor_list.pin_memory()
+            self.packed_repeat_masks = self.packed_repeat_masks.pin_memory()
+            self.packed_ref_masks = self.packed_ref_masks.pin_memory()
 
         if hasattr(self, 'packed_vit_images'):
             self.packed_vit_images = self.packed_vit_images.pin_memory()
@@ -753,6 +1192,18 @@ class SimpleCustomBatch:
             self.packed_label_ids = self.packed_label_ids.pin_memory()
             self.ce_loss_indexes = self.ce_loss_indexes.pin_memory()
             self.ce_loss_weights = self.ce_loss_weights.pin_memory()
+
+        if hasattr(self, 'pass1_sequence_length'):
+            self.pass1_packed_text_ids = self.pass1_packed_text_ids.pin_memory()
+            self.pass1_packed_text_indexes = self.pass1_packed_text_indexes.pin_memory()
+            self.pass1_packed_position_ids = self.pass1_packed_position_ids.pin_memory()
+            self.pass1_packed_dino_token_indexes = self.pass1_packed_dino_token_indexes.pin_memory()
+            self.pass1_dino_token_seqlens = self.pass1_dino_token_seqlens.pin_memory()
+            self.pass1_dino_grid_thw = self.pass1_dino_grid_thw.pin_memory()
+            self.pass1_question_text_indexes = self.pass1_question_text_indexes.pin_memory()
+
+        if hasattr(self, 'qformer_token_indexes'):
+            self.qformer_token_indexes = self.qformer_token_indexes.pin_memory()
 
         return self
 
@@ -774,6 +1225,8 @@ class SimpleCustomBatch:
             self.packed_world_points =  self.packed_world_points.to(device, non_blocking=non_blocking)
             self.packed_point_masks = self.packed_point_masks.to(device, non_blocking=non_blocking)
             self.packed_dino_image_tensor_list = self.packed_dino_image_tensor_list.to(device, non_blocking=non_blocking)
+            self.packed_repeat_masks = self.packed_repeat_masks.to(device, non_blocking=non_blocking)
+            self.packed_ref_masks = self.packed_ref_masks.to(device, non_blocking=non_blocking)
 
         if hasattr(self, 'packed_vit_images'):
             self.packed_vit_images = self.packed_vit_images.to(device, non_blocking=non_blocking)
@@ -785,6 +1238,18 @@ class SimpleCustomBatch:
             self.packed_label_ids = self.packed_label_ids.to(device, non_blocking=non_blocking)
             self.ce_loss_indexes = self.ce_loss_indexes.to(device, non_blocking=non_blocking)
             self.ce_loss_weights = self.ce_loss_weights.to(device, non_blocking=non_blocking)
+
+        if hasattr(self, 'pass1_sequence_length'):
+            self.pass1_packed_text_ids = self.pass1_packed_text_ids.to(device, non_blocking=non_blocking)
+            self.pass1_packed_text_indexes = self.pass1_packed_text_indexes.to(device, non_blocking=non_blocking)
+            self.pass1_packed_position_ids = self.pass1_packed_position_ids.to(device, non_blocking=non_blocking)
+            self.pass1_packed_dino_token_indexes = self.pass1_packed_dino_token_indexes.to(device, non_blocking=non_blocking)
+            self.pass1_dino_token_seqlens = self.pass1_dino_token_seqlens.to(device, non_blocking=non_blocking)
+            self.pass1_dino_grid_thw = self.pass1_dino_grid_thw.to(device, non_blocking=non_blocking)
+            self.pass1_question_text_indexes = self.pass1_question_text_indexes.to(device, non_blocking=non_blocking)
+
+        if hasattr(self, 'qformer_token_indexes'):
+            self.qformer_token_indexes = self.qformer_token_indexes.to(device, non_blocking=non_blocking)
 
         return self
 
@@ -814,6 +1279,8 @@ class SimpleCustomBatch:
             data['packed_world_points'] = self.packed_world_points 
             data['packed_point_masks'] = self.packed_point_masks
             data['packed_dino_image_tensor_list'] = self.packed_dino_image_tensor_list
+            data['packed_repeat_masks'] = self.packed_repeat_masks
+            data['packed_ref_masks'] = self.packed_ref_masks
             data['img_per_seq_lens'] = self.img_per_seq_lens
             data['packed_view_infos'] = self.packed_view_infos
             data['packed_image_paths'] = self.packed_image_paths
@@ -828,6 +1295,24 @@ class SimpleCustomBatch:
             data['packed_label_ids'] = self.packed_label_ids
             data['ce_loss_indexes'] = self.ce_loss_indexes
             data['ce_loss_weights'] = self.ce_loss_weights
+
+        if hasattr(self, 'pass1_sequence_length'):
+            data['pass1_sequence_length'] = self.pass1_sequence_length
+            data['pass1_sample_lens'] = self.pass1_sample_lens
+            data['pass1_packed_text_ids'] = self.pass1_packed_text_ids
+            data['pass1_packed_text_indexes'] = self.pass1_packed_text_indexes
+            data['pass1_packed_position_ids'] = self.pass1_packed_position_ids
+            data['pass1_split_lens'] = self.pass1_split_lens
+            data['pass1_attn_modes'] = self.pass1_attn_modes
+            data['pass1_packed_dino_token_indexes'] = self.pass1_packed_dino_token_indexes
+            data['pass1_dino_token_seqlens'] = self.pass1_dino_token_seqlens
+            data['pass1_dino_grid_thw'] = self.pass1_dino_grid_thw
+            data['pass1_question_text_indexes'] = self.pass1_question_text_indexes
+            data['pass1_question_text_lengths'] = self.pass1_question_text_lengths
+            data['pass1_dino_images_per_sample'] = self.pass1_dino_images_per_sample
+
+        if hasattr(self, 'qformer_token_indexes'):
+            data['qformer_token_indexes'] = self.qformer_token_indexes
 
         return data
 

@@ -384,6 +384,118 @@ def apply_template_qwenvl2_reconThenUnd(question_with_image_tokens,answer,task):
     return ret
             
 
+def apply_template_qwenvl2_reconForUnd(question_with_image_tokens, answer, task):
+    """
+    Build two independent split_lists for recon-for-und two-pass forward.
+    
+    Returns:
+        (split_list_pass1, split_list_pass2) where:
+        
+        split_list_pass1 contains: system + instruction + dino_images + question_text
+            - Used for frozen encoder forward to produce dino/question hidden states
+            - Items: text (system, instruction, question) and dino images
+            
+        split_list_pass2 contains: qformer_output + vit_images + question_text + assistant_prompt + answer
+            - Used for trainable forward with Q-Former output replacing dino images
+            - Items: qformer_placeholder (replacing dino), vit images, text (question, assistant, answer)
+            - 'qformer_placeholder' items mark where Q-Former output tokens go
+    """
+    chat_template1 = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
+    chat_template2 = question_with_image_tokens
+    chat_template3 = '<|im_end|>\n<|im_start|>assistant'
+    if len(answer) > 0:
+        chat_template4 = '\n' + answer
+
+    pass1 = []
+    pass2 = []
+    pattern = r'(<vit_image>|<dino_image>)'
+    chat_template2_split = re.split(pattern, chat_template2)    
+    chat_template2_split = [p for p in chat_template2_split if len(p) > 0]
+
+    # System prompt
+    pass1.append({
+        'type': 'text',
+        'loss': False,
+        'value': chat_template1,
+        'role': 'system',
+    })
+    pass2.append({
+        'type': 'text',
+        'loss': False,
+        'value': chat_template1,
+        'role': 'system',
+    })
+
+    # Task Context
+
+    pass1.append({
+        'type': 'text',
+        'loss': False,
+        'value': 'Reconstruct the 3D scene.',
+        'role': 'instruction',
+    })
+
+    pass2.append({
+            'type': 'qformer_placeholder',
+            'loss': False,
+            'value': '<qformer_placeholder>',
+            'role': 'qformer',
+        })
+
+    # Question content (may contain dino/vit image tokens interleaved with text)
+    # All dino images in a sample map to a SINGLE qformer_placeholder in pass2
+    for split_ in chat_template2_split:
+        if split_ not in ['<vit_image>', '<dino_image>']:
+            # Question text appears in BOTH pass1 and pass2
+            pass1.append({
+                'type': 'text',
+                'loss': False,
+                'value': split_,
+                'role': 'question',
+            })
+            pass2.append({
+                'type': 'text',
+                'loss': False,
+                'value': split_,
+                'role': 'question',
+            })
+        elif split_ == '<vit_image>':
+            # VIT images only in pass2
+            pass2.append({
+                'type': 'vit',
+                'loss': False,
+                'value': split_,
+                'role': 'vit',
+            })
+        elif split_ == '<dino_image>':
+            # Dino images in pass1 (original)
+            pass1.append({
+                'type': 'dino',
+                'loss': False,
+                'value': split_,
+                'role': 'dino',
+            })
+
+    # Assistant prompt - pass2 only
+    pass2.append({
+        'type': 'text',
+        'loss': False,
+        'value': chat_template3,
+        'role': 'assistant_prompt',
+    })
+
+    # Answer - pass2 only, with loss
+    if len(answer) > 0:
+        pass2.append({
+            'type': 'text',
+            'loss': True,
+            'value': chat_template4,
+            'role': 'answer',
+        })
+
+    return pass1, pass2
+
+
 def apply_template_qwenvl2(question_with_image_tokens,answer):
     chat_template1 = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
     chat_template2=question_with_image_tokens

@@ -5,7 +5,7 @@ from PIL import Image, ImageFile, PngImagePlugin
 from idna import intranges_contain
 
 from .interleave_t2i_dataset import InterleavedBaseIterableDataset, ParquetStandardIterableDataset
-from ..data_utils import pil_img2rgb, apply_template_qwenvl2, apply_template_qwenvl2_reconThenUnd
+from ..data_utils import pil_img2rgb, apply_template_qwenvl2, apply_template_qwenvl2_reconThenUnd, apply_template_qwenvl2_reconForUnd
 from ..distributed_iterable_dataset import DistributedIterableDataset
 from ..dataset_utils_vggt import *
 import torch
@@ -178,6 +178,10 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                             num_additional_to_select,
                             replace=(should_replace_for_others or (len(pool_for_others_values) < num_additional_to_select))
                         ))
+
+                # Fill missing samples if stratified sampling produced fewer than needed
+                while len(additional_selected_values) < num_additional_to_select:
+                    additional_selected_values.append(rng.choice(pool_for_others_values))
 
                 idxs = [ref_frame_val, *additional_selected_values]
 
@@ -357,17 +361,21 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
     def _init_data(self):
         data = {
             'sequence_plan': [],
+            # text-related
             'text_ids_list': [],
+            # vit-related
             'image_tensor_list': [],
             'image_grid_thw_list': [],
-            'dino_images': [],
+            # 3d annotation
             'depths': [],
             'extrinsics': [],
             'intrinsics': [],
             'cam_points': [],
             'world_points': [],
             'point_masks': [],
+            # geo-related 
             'original_sizes': [],
+            'dino_images': [],
             'dino_image_tensor_list': [],
             'dino_thw': [],
             'img_per_seq': 0,
@@ -375,10 +383,11 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
             'new_depths': [],
             'view_infos': [],
             'image_paths': [],
+            'repeat_mask': [],
         }
         return data
 
-    def _add_text(self, data, text, need_loss, enable_cfg=True):
+    def _add_text(self, data, text, need_loss, enable_cfg=True, role=''):
         text_ids = self.tokenizer.encode(text)
         data['num_tokens'] += len(text_ids)
         data['text_ids_list'].append(text_ids)
@@ -389,6 +398,7 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 'loss': int(need_loss),
                 'special_token_loss': 0,
                 'special_token_label': None,
+                'role': role,
             }
         )
         return data
@@ -569,11 +579,11 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                 scene_intrinsic = row['intrinsic']
 
         # ── Step 1: Sample view indices (shared across all scenes) ──
-        if num_imgs != self.frame_num:
-            max_distance = 20 if data_scene_name in ['scannet'] else 10
-            idxs = self._sample_view_indices(num_imgs, rng, max_distance=max_distance)
-        else:
-            idxs = list(range(num_imgs))
+        # if num_imgs != self.frame_num:
+        #     max_distance = 20 if data_scene_name in ['scannet'] else 10
+        #     idxs = self._sample_view_indices(num_imgs, rng, max_distance=max_distance)
+        # else:
+        idxs = list(range(num_imgs))
 
         # Apply sampling — only for dino branch (frame_num aligned)
         dino_image_paths = [all_image_paths[i] for i in idxs]
@@ -701,34 +711,42 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
             dino_view_infos = [dino_view_infos[i] for i in indices]
             dino_image_paths = [dino_image_paths[i] for i in indices]
 
-        # ── Step 5: Build data dict ──
-        data = self._init_data()
-        data['img_per_seq'] = len(dino_images)
-        data['image_paths'] = dino_image_paths
-
-        # Build template: dino images + question with vit images
-        num_vit_tokens = question.count('<image>')
-        assert num_vit_tokens == len(raw_images), f"num_vit_tokens={num_vit_tokens}, len(raw_images)={len(raw_images)}"
-
+        # ── Step 5: Build data dicts for pass1 and pass2 ──
+        # parse_row returns (data_pass1, data_pass2) tuple for recon-for-und
+        # Each is a fully independent sample with its own sequence_plan, text_ids_list, etc.
+        
+        # Build two independent split_lists
         text_with_images = question.replace('<image>', '<vit_image>')
-        text_with_images = '<dino_image>' * len(dino_images) + text_with_images
-        split_list = apply_template_qwenvl2_reconThenUnd(text_with_images, answer, task='geo_then_und')
+        text_with_images = "<dino_image>" * len(dino_images) + text_with_images
+        split_list_pass1, split_list_pass2 = apply_template_qwenvl2_reconForUnd(text_with_images, answer, task='und')
 
         # Count total dino images for split_start/split_end bi-directional attention
-        total_dino_count = sum(1 for item in split_list if item['type'] == 'dino')
-        dino_counter = 0
+        total_dino_count = sum(1 for item in split_list_pass1 if item['type'] == 'dino')
 
-        # Prepare per-view queues for _add_image
+        # Prepare per-view queues for _add_image (shared between pass1 and pass2)
         dino_images_queue = list(dino_images)
         dino_depths_queue = list(dino_depths)
         dino_extrinsics_queue = list(dino_extrinsics)
         dino_intrinsics_queue = list(dino_intrinsics)
         dino_view_infos_queue = list(dino_view_infos)
+        raw_images_queue = list(raw_images)
 
-        for item in split_list:
+        # ── Build data_pass1: dino_images + system/instruction/question text ──
+        data_pass1 = self._init_data()
+        data_pass1['img_per_seq'] = len(dino_images)
+        data_pass1['image_paths'] = dino_image_paths
+        data_pass1['is_pass1'] = True  # Flag for pack_sequence to route correctly
+
+        dino_counter = 0
+        for item in split_list_pass1:
             try:
                 if item['type'] == 'text':
-                    data = self._add_text(data, item["value"], need_loss=item['loss'])
+                    data_pass1 = self._add_text(
+                        data_pass1, 
+                        item['value'], 
+                        need_loss=item['loss'],
+                        role=item.get('role', ''),
+                    )
                 elif item['type'] == 'dino':
                     image, dino_images_queue = self.pop_first(dino_images_queue)
                     depth_map, dino_depths_queue = self.pop_first(dino_depths_queue)
@@ -743,36 +761,69 @@ class ReconthenUndIterableDataset(ParquetStandardIterableDataset, DistributedIte
                         'intrinsic_': intri,
                     }
 
-                    # Determine split_start/split_end for bi-directional attention across all dino images
                     is_split_start = (dino_counter == 0)
                     is_split_end = (dino_counter == total_dino_count - 1)
                     dino_counter += 1
-                    data = self._add_image(
-                        data, 
+                    data_pass1 = self._add_image(
+                        data_pass1,
                         image,
                         dino_meta=dino_meta,
-                        need_loss=False, 
-                        need_dino=True, 
-                        need_vit=False, 
+                        need_loss=False,
+                        need_dino=True,
+                        need_vit=False,
                         rng=rng,
                         view_info=this_view_info,
                         has_3d_annotation=has_3d_annotation,
-                        split_start=is_split_start,
-                        split_end=is_split_end,
+                        # split_start=is_split_start,
+                        # split_end=is_split_end,
+                    )
+                    data_pass1['sequence_plan'][-1]['role'] = 'dino'
+            except AssertionError as e:
+                print(e, 'skipping pass1')
+                return []
+
+        # ── Build data_pass2: qformer_placeholder + vit_images + question/answer text ──
+        data_pass2 = self._init_data()
+        data_pass2['img_per_seq'] = 0
+        data_pass2['image_paths'] = []
+        data_pass2['is_pass2'] = True  # Flag for pack_sequence to route correctly
+
+        for item in split_list_pass2:
+            try:
+                if item['type'] == 'text':
+                    data_pass2 = self._add_text(
+                        data_pass2, item['value'], need_loss=item['loss'],
+                        role=item.get('role', ''),
                     )
                 elif item['type'] == 'vit':
-                    image, raw_images = self.pop_first(raw_images)
+                    image, raw_images_queue = self.pop_first(raw_images_queue)
                     dino_meta = {'scene_name': data_scene_name}
-                    data = self._add_image(
-                            data, 
-                            image,
-                            dino_meta=dino_meta,
-                            need_loss=False, 
-                            need_dino=False, 
-                            need_vit=True, 
-                        )
+                    data_pass2 = self._add_image(
+                        data_pass2,
+                        image,
+                        dino_meta=dino_meta,
+                        need_loss=False,
+                        need_dino=False,
+                        need_vit=True,
+                    )
+                elif item['type'] == 'qformer_placeholder':
+                    # Single placeholder for ALL dino images in this sample
+                    # The actual token count (num_query_tokens) is determined in dataset_base
+                    data_pass2['sequence_plan'].append({
+                        'type': 'qformer_placeholder',
+                        'enable_cfg': 0,
+                        'loss': 0,
+                        'special_token_loss': 0,
+                        'special_token_label': None,
+                        'role': 'qformer',
+                        'split_start': True,
+                        'split_end': True,
+                    })
             except AssertionError as e:
-                print(e, 'skipping')
-                return [] 
+                print(e, 'skipping pass2')
+                return []
 
-        return data
+        # Combine num_tokens for buffer management (used by pack_sequence caller)
+        total_num_tokens = data_pass1['num_tokens'] + data_pass2['num_tokens']
+
+        return (data_pass1, data_pass2)

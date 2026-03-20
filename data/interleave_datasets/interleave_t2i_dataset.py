@@ -201,13 +201,13 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
     
                             if len(data) == 0:
                                 continue
-                            data['data_indexes'] = {
+                            
+                            _data_indexes = {
                                 "data_indexes": [global_row_group_idx, row_idx],
                                 "worker_id": worker_id,
                                 "dataset_name": self.dataset_name,
                             }
-        
-                            data['parquet_info'] = {
+                            _parquet_info = {
                                 "file": parquet_file_path,
                                 "row_group": int(row_group_id),
                                 "row_idx": int(row_idx),
@@ -215,6 +215,13 @@ class ParquetStandardIterableDataset(DistributedIterableDataset):
                                 "worker_id": int(worker_id),
                                 "dataset": self.dataset_name,
                             }
+                            # Handle both tuple (recon-for-und) and dict samples
+                            if isinstance(data, tuple):
+                                data[0]['data_indexes'] = _data_indexes
+                                data[0]['parquet_info'] = _parquet_info
+                            else:
+                                data['data_indexes'] = _data_indexes
+                                data['parquet_info'] = _parquet_info
     
                         except Exception as e:
                             print(f'Error type={type(e).__name__}, msg="{e}" in rg#{row_group_id}, {parquet_file_path}, row_idx={row_idx}')
