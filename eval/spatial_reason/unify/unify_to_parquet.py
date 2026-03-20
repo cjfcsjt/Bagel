@@ -10,6 +10,7 @@ Supported datasets
 3. **OmniSpatial** – JSON benchmark  (image-only, no depth/pose)
 4. **OST-Bench**   – JSON (LLaVA interleaved or plain eval format, image-only)
 5. **SenseNova-SI** – JSONL (832K spatial intelligence samples, image-only)
+6. **RE10K**       – RealEstate10K multi-view scene folders (image-only, no depth/pose)
 
 Target Parquet row schema (matches ``parse_row`` in ``interleave_t2i_dataset.py``):
     question        : string
@@ -596,7 +597,7 @@ def _mindcube_item_to_row(data_item: dict, image_root: str, ds_name: str, index:
             role = turn.get("from", "")
             value = turn.get("value", "")
             if role == "human":
-                question = value.replace('<image>\n', '')
+                question = value # .replace('<image>\n', '')
             elif role == "gpt":
                 answer = value
     else:
@@ -667,7 +668,7 @@ def process_mindcube(
     all_rows_for_csv: List[dict] = []  # Collect rows for CSV export
 
     for ds_name, ds_meta in ds_collections.items():
-        if ds_name != 'MindCube_train_ff_rsn':
+        if 'raw_qa' not in ds_name:
             continue
         annotation_path = os.path.join(mindcube_data_root, ds_meta["annotation"])
         image_root = os.path.join(mindcube_data_root, ds_meta["root"])
@@ -702,7 +703,7 @@ def process_mindcube(
 
         skipped = 0
         global_idx = 0
-        data_items = data_items[:10]
+        # data_items = data_items[:10]
         for data_item in tqdm(data_items, desc=f"  MindCube/{ds_name}"):
             row = _mindcube_item_to_row(data_item, image_root, ds_name, index=global_idx)
             global_idx += 1
@@ -844,9 +845,10 @@ def _sensenova_si_item_to_row(data_item: dict, image_root: str, task_type: str) 
 def process_sensenova_si(
     jsonl_path: str,
     image_root: str,
-    geo_writer: ParquetBufferedWriter,
-    und_writer: ParquetBufferedWriter,
+    writer: ParquetBufferedWriter = None,
+    min_images_per_sample: int = 1,
     max_images_per_sample: int = 8,
+    task = 'geo',
 ):
     """
     Load SenseNova-SI-800K JSONL → rows.
@@ -860,6 +862,7 @@ def process_sensenova_si(
                     (the directory containing the 'images/' folder)
         geo_writer: ParquetBufferedWriter for geo task
         und_writer: ParquetBufferedWriter for und task
+        min_images_per_sample: Skip samples with fewer images than this
         max_images_per_sample: Skip samples with more images than this
     """
     print(f"\n[SenseNova-SI] Loading {jsonl_path}")
@@ -885,32 +888,142 @@ def process_sensenova_si(
                 total_skipped += 1
                 continue
 
-            # Derive geo row
-            geo_row = _sensenova_si_item_to_row(data_item, image_root, task_type='geo')
-            # Derive und row
-            und_row = _sensenova_si_item_to_row(data_item, image_root, task_type='und')
+            row = _sensenova_si_item_to_row(data_item, image_root, task_type=task)
 
-            if geo_row is None or und_row is None:
+            if row is None:
                 total_skipped += 1
                 continue
 
-            n_images = len(geo_row["image_path"])
+            n_images = len(row["image_path"])
             if n_images > max_images_per_sample:
+                total_skipped += 1
+                continue
+            if n_images < min_images_per_sample:
                 total_skipped += 1
                 continue
             
 
             img_stats.record(n_images, {
                 "id": data_item.get("id", ""),
-                "image_path": geo_row["image_path"],
-                "question": geo_row["question"][:200] if geo_row["question"] else "",
+                "image_path": row["image_path"],
+                "question": row["question"][:200] if row["question"] else "",
             })
-
-            geo_writer.add(geo_row)
-            und_writer.add(und_row)
+            writer.add(row)
             total_processed += 1
 
-    print(f"[SenseNova-SI] processed={total_processed}, skipped={total_skipped}")
+    print(f"[SenseNova-SI] task={task} processed={total_processed}, skipped={total_skipped}")
+    img_stats.print_summary()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  RE10K (RealEstate10K) – multi-view scene dataset
+# ═════════════════════════════════════════════════════════════════════════
+
+def _re10k_scene_to_row(scene_dir: str, scene_name: str) -> Optional[dict]:
+    """
+    Convert a single RE10K scene folder into the target Parquet row schema.
+
+    Each scene folder contains multiple PNG frames named by timestamps
+    (e.g. ``52553000.png``).  All frames of a scene are packed into one row
+    as a multi-view image list.
+
+    Args:
+        scene_dir:  Absolute path to the scene folder.
+        scene_name: Name of the scene (folder basename, e.g. '0000cc6d8b108390').
+
+    Returns:
+        A dict matching ``ARROW_SCHEMA``, or ``None`` if no valid images found.
+    """
+    # Collect all PNG files sorted by timestamp
+    image_files = sorted(
+        f for f in os.listdir(scene_dir)
+        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+    )
+    if not image_files:
+        return None
+
+    image_list = [os.path.join(scene_dir, f) for f in image_files]
+    n_images = len(image_list)
+
+    # RE10K is a pure multi-view reconstruction dataset:
+    # no text question/answer, no depth, no pose in this raw format.
+    meta = {
+        "type": "re10k",
+        "id": scene_name,
+        "n_frames": n_images,
+    }
+
+    return {
+        "question":        "",
+        "answer":          "",
+        "scene_name":      scene_name,
+        "dataset_name":    "re10k",
+        "image_path":      image_list,
+        "depth_list":      [],
+        "poses":           [_IDENTITY_4x4] * n_images,
+        "intrinsic":       _IDENTITY_4x4,
+        "depth_intrinsic": _IDENTITY_4x4,
+        "metadata":        _ensure_metadata_str(meta),
+    }
+
+
+def process_re10k(
+    data_root: str,
+    writer: ParquetBufferedWriter,
+    min_frames: int = 2,
+    max_frames: int = 0,
+):
+    """
+    Scan all scene folders under ``data_root`` and convert each scene
+    into one Parquet row.
+
+    Args:
+        data_root:  Path to the RE10K snapshot directory containing
+                    scene folders (e.g. ``0000cc6d8b108390/``).
+        writer:     Parquet writer to flush rows into.
+        min_frames: Skip scenes with fewer frames than this (default 2).
+        max_frames: Skip scenes with more frames than this (0 = no limit).
+    """
+    print(f"\n[RE10K] Scanning scenes under {data_root}")
+
+    # Enumerate scene directories
+    scene_names = sorted(
+        d for d in os.listdir(data_root)
+        if os.path.isdir(os.path.join(data_root, d))
+    )
+    print(f"  Found {len(scene_names)} scene folders")
+
+    img_stats = ImageStatsCollector("RE10K")
+    total_processed = 0
+    total_skipped = 0
+
+    for scene_name in tqdm(scene_names, desc="RE10K scenes"):
+        scene_dir = os.path.join(data_root, scene_name)
+        row = _re10k_scene_to_row(scene_dir, scene_name)
+        if row is None:
+            total_skipped += 1
+            continue
+
+        n_images = len(row["image_path"])
+
+        # Apply frame count filters
+        if n_images < min_frames:
+            total_skipped += 1
+            continue
+        if max_frames > 0 and n_images > max_frames:
+            total_skipped += 1
+            continue
+
+        img_stats.record(n_images, {
+            "scene": scene_name,
+            "n_frames": n_images,
+            "first_image": row["image_path"][0] if row["image_path"] else "",
+        })
+
+        writer.add(row)
+        total_processed += 1
+
+    print(f"[RE10K] processed={total_processed}, skipped={total_skipped}")
     img_stats.print_summary()
 
 
@@ -1025,6 +1138,15 @@ def parse_args():
     p.add_argument("--sensenova-si-image-root", type=str, default=None,
                    help="Root directory containing the 'images/' folder "
                         "for SenseNova-SI (the snapshot directory)")
+
+    # ── RE10K ──
+    p.add_argument("--re10k-data-root", type=str, default=None,
+                   help="Path to RE10K snapshot directory containing scene "
+                        "sub-folders (e.g. .../snapshots/<hash>/)")
+    p.add_argument("--re10k-min-frames", type=int, default=2,
+                   help="Skip RE10K scenes with fewer frames (default: 2)")
+    p.add_argument("--re10k-max-frames", type=int, default=0,
+                   help="Skip RE10K scenes with more frames (0=no limit)")
 
     # ── Annotation Control ──
     p.add_argument("--need-3d-annotation", action="store_true", default=False,
@@ -1178,13 +1300,46 @@ def main():
         process_sensenova_si(
             args.sensenova_si_jsonl,
             args.sensenova_si_image_root,
-            geo_writer,
-            und_writer,
+            writer=geo_writer,
+            min_images_per_sample=2,
+            max_images_per_sample=16,
+            task='geo'
         )
         geo_writer.finish()
+
+        process_sensenova_si(
+            args.sensenova_si_jsonl,
+            args.sensenova_si_image_root,
+            writer=geo_writer,
+            min_images_per_sample=1,
+            max_images_per_sample=16,
+            task='und'
+        )
         und_writer.finish()
         geo_info_tracker.summary()
         und_info_tracker.summary()
+
+    # ------------------------------------------------------------------
+    #  RE10K
+    # ------------------------------------------------------------------
+    if args.re10k_data_root is not None:
+        any_dataset = True
+        out = (os.path.join(args.output_dir, "re10k")
+               if args.split_by_dataset else args.output_dir)
+        re10k_info_tracker = ParquetInfoTracker(out)
+        writer = ParquetBufferedWriter(
+            out, "re10k", ARROW_SCHEMA,
+            args.rows_per_file, args.rows_per_row_group,
+            info_tracker=re10k_info_tracker,
+        )
+        process_re10k(
+            args.re10k_data_root,
+            writer,
+            min_frames=args.re10k_min_frames,
+            max_frames=args.re10k_max_frames,
+        )
+        writer.finish()
+        re10k_info_tracker.summary()
 
     # ------------------------------------------------------------------
     #  Finish
