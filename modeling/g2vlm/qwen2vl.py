@@ -298,7 +298,7 @@ class PackedAttention(Qwen2VLAttention):
             self.k_norm = nn.Identity()
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -469,7 +469,9 @@ class PackedAttentionMoT(Qwen2VLAttention):
         return self._saved_query_states, self._saved_key_states
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        # Dispatch based on presence of packed_sequence arg (supports both
+        # explicit forward_train calls from inference and normal training).
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -479,11 +481,12 @@ class PackedAttentionMoT(Qwen2VLAttention):
         packed_sequence: torch.Tensor,
         sample_lens: List[int],
         attention_mask,
-        packed_position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        packed_und_token_indexes: torch.LongTensor,
-        packed_geo_token_indexes: torch.LongTensor,
+        packed_position_embeddings: torch.Tensor = None,
+        packed_und_token_indexes: Optional[torch.LongTensor] = None,
+        packed_geo_token_indexes: Optional[torch.LongTensor] = None,
     ):
-        def _check_nan_inf(tensor, name):
+
+        def _check_nan_inf(tensor, name):            
             has_nan = torch.isnan(tensor).any().item()
             has_inf = torch.isinf(tensor).any().item()
             if has_nan or has_inf:
@@ -801,7 +804,7 @@ class Qwen2VLDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -900,7 +903,9 @@ class Qwen2VLMoTDecoderLayer(nn.Module):
         self.post_attention_layernorm_moe_geo = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        # Dispatch based on presence of packed_sequence arg (supports both
+        # explicit forward_train calls from inference and normal training).
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -1094,7 +1099,7 @@ class Qwen2VLMoEDecoderLayer(nn.Module):
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -1363,7 +1368,9 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
 
 
     def forward(self, *args, **kwargs):
-        if self.training:
+        # Dispatch based on presence of packed_sequence arg (supports both
+        # explicit forward_train calls from inference and normal training).
+        if self.training or 'packed_sequence' in kwargs:
             return self.forward_train(*args, **kwargs)
         else:
             return self.forward_inference(*args, **kwargs)
@@ -1372,8 +1379,8 @@ class Qwen2VLModel(Qwen2VLPreTrainedModel):
         self,
         packed_sequence: torch.Tensor,
         sample_lens: List[int],
-        attention_mask,
         packed_position_ids: torch.Tensor,
+        attention_mask,        
         packed_und_token_indexes: Optional[torch.LongTensor] = None,
         packed_geo_token_indexes: Optional[torch.LongTensor] = None,
         output_hidden_states: Optional[bool] = None,
