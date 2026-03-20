@@ -8,8 +8,7 @@ from PIL import Image
 import torch
 
 from data.data_utils import pil_img2rgb
-# from modeling.bagel.qwen2_navit import NaiveCache
-from modeling.g2vlm.qwen2vl import NaiveCache
+from modeling.bagel.qwen2_navit import NaiveCache
 
 
 
@@ -21,13 +20,12 @@ The planning process is enclosed within <think> </think> tags, i.e. <think> plan
 
 
 class InterleaveInferencer:
-    def __init__(self, model, vae_model, tokenizer, vae_transform, vit_transform, dino_transform, new_token_ids):
+    def __init__(self, model, vae_model, tokenizer, vae_transform, vit_transform, new_token_ids):
         self.model = model
         self.vae_model = vae_model
         self.tokenizer = tokenizer
         self.vae_transform = vae_transform
         self.vit_transform = vit_transform
-        self.dino_transform = dino_transform
         self.new_token_ids = new_token_ids
         
     def init_gen_context(self): 
@@ -52,39 +50,12 @@ class InterleaveInferencer:
             tokenizer=self.tokenizer, 
             new_token_ids=self.new_token_ids,
         )
-        generation_input = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in generation_input.items()}
+
         past_key_values = self.model.forward_cache_update_text(past_key_values, **generation_input)        
         gen_context['kv_lens'] = kv_lens
         gen_context['ropes'] = ropes
         gen_context['past_key_values'] = past_key_values
         
-        return gen_context
-
-    @torch.no_grad()
-    def update_context_dino_images(self, images, gen_context):
-        """Update context with DINO features, processing each image independently.
-        Each DINO image is forwarded into the KV cache one by one, so that
-        later images can attend to earlier ones but not vice versa (causal),
-        consistent with the training-side attention mask behavior.
-        """
-        for image in images:
-            past_key_values = gen_context['past_key_values']
-            kv_lens = gen_context['kv_lens']
-            ropes = gen_context['ropes']
-
-            generation_input, kv_lens, ropes = self.model.prepare_dino_images_pi3(
-                curr_kvlens=kv_lens,
-                curr_rope=ropes, 
-                images=[image],
-                transforms=self.dino_transform, 
-                new_token_ids=self.new_token_ids,
-            )
-            generation_input = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in generation_input.items()}
-            past_key_values, last_hidden_state = self.model.forward_cache_update_dino(past_key_values, **generation_input)
-            gen_context['kv_lens'] = kv_lens
-            gen_context['ropes'] = ropes
-            gen_context['past_key_values'] = past_key_values
-
         return gen_context
 
     @torch.no_grad()
@@ -116,7 +87,6 @@ class InterleaveInferencer:
                 transforms=self.vit_transform, 
                 new_token_ids=self.new_token_ids,
             )
-            generation_input = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in generation_input.items()}
             past_key_values = self.model.forward_cache_update_vit(past_key_values, **generation_input)
 
         gen_context['kv_lens'] = kv_lens
@@ -221,8 +191,7 @@ class InterleaveInferencer:
         kv_lens = gen_context['kv_lens']
         ropes = gen_context['ropes']
 
-        generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.tokenizer, self.new_token_ids)
-        generation_input = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in generation_input.items()}
+        generation_input = self.model.prepare_start_tokens(kv_lens, ropes, self.new_token_ids)
         unpacked_latent = self.model.generate_text(
             past_key_values=past_key_values,
             max_length=max_length,
@@ -231,8 +200,7 @@ class InterleaveInferencer:
             end_token_id=self.new_token_ids['eos_token_id'],
             **generation_input,
         )
-        output = self.tokenizer.decode(unpacked_latent[1:,0])
-
+        output = self.tokenizer.decode(unpacked_latent[:,0])
         output = output.split('<|im_end|>')[0].split('<|im_start|>')[1]
         return output
         
@@ -270,28 +238,15 @@ class InterleaveInferencer:
                     system_prompt = GEN_THINK_SYSTEM_PROMPT
                 gen_context = self.update_context_text(system_prompt, gen_context)
                 cfg_img_context = self.update_context_text(system_prompt, cfg_img_context)
-            else:
-                system_prompt = '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n'
-                gen_context = self.update_context_text(system_prompt, gen_context)
-                cfg_img_context = self.update_context_text(system_prompt, cfg_img_context)
-
-            # Collect all images for DINO (DINO processes all images at once, before VIT)
-            all_images = [img for img in input_lists if isinstance(img, Image.Image)]
-            if all_images:
-                system_prompt = 'Reconstruct the 3D scene.'
-                gen_context = self.update_context_text(system_prompt, gen_context)
-                gen_context = self.update_context_dino_images(all_images, gen_context)
 
             for input_term in input_lists:
                 if isinstance(input_term, str):
-                    input_term = input_term
                     cfg_text_context = deepcopy(gen_context)
                     gen_context = self.update_context_text(input_term, gen_context)
                     cfg_img_context = self.update_context_text(input_term, cfg_img_context)
-                    input_term = '<|im_end|>\n<|im_start|>assistant'
-                    gen_context = self.update_context_text(input_term, gen_context)
 
                 elif isinstance(input_term, Image.Image):
+                    input_term = self.vae_transform.resize_transform(pil_img2rgb(input_term))
                     gen_context = self.update_context_image(input_term, gen_context, vae=not understanding_output)
 
                     image_shapes = input_term.size[::-1]
