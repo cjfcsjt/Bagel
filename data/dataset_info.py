@@ -1,9 +1,10 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # SPDX-License-Identifier: Apache-2.0
 
-from .interleave_datasets import UnifiedEditIterableDataset, MaskedReconIterableDataset
+from .interleave_datasets import UnifiedEditIterableDataset, MaskedReconIterableDataset, MAEMaskedReconIterableDataset
 from .recon_dataset import SftJSONLIterableReconDataset
 from .vlm_dataset import SftJSONLIterableDataset
+from .videollm3d_dataset import VideoLLM3DIterableDataset
 from .interleave_datasets.recon_then_und_dataset import ReconthenUndIterableDataset
 from .interleave_datasets.und_dataset import UndIterableDataset
 from .interleave_datasets.recon_dataset_parquet import ReconParquetIterableDataset
@@ -11,9 +12,11 @@ from .interleave_datasets.recon_dataset_parquet import ReconParquetIterableDatas
 DATASET_REGISTRY = {
     # 'recon': SftJSONLIterableReconDataset,
     'vlm_sft': SftJSONLIterableDataset,
+    'videollm3d': VideoLLM3DIterableDataset,
     'recon_then_und': ReconthenUndIterableDataset,
     'recon_parquet': ReconParquetIterableDataset,
     'recon': MaskedReconIterableDataset,
+    'mae_recon': MAEMaskedReconIterableDataset,
     'und': UndIterableDataset,
     'recon_for_und': ReconthenUndIterableDataset,
     'unified_edit': UnifiedEditIterableDataset,
@@ -22,6 +25,18 @@ DATASET_REGISTRY = {
 
 DATASET_INFO = {
     'recon': {
+        're10k': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_re10k/re10k/', # path of the parquet files
+            'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_re10k/re10k/parquet_info.json'
+        },
+        'blendedmvs': {
+            'data_dir': '/data/spatial_data/data/blendedmvs', # path of the parquet files
+            'jsonl_path': '/data/spatial_data/data/blendedmvs/processed/blendmvs_scenes.jsonl', # path of the jsonl file
+            'num_files': 10, # number of data units to be sharded across all ranks and workers
+            'num_total_samples': 1000, # number of total samples in the dataset
+        },
+    },
+    'mae_recon': {
         're10k': {
             'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_re10k/re10k/', # path of the parquet files
             'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_re10k/re10k/parquet_info.json'
@@ -47,8 +62,16 @@ DATASET_INFO = {
             "parquet_info_path": '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_sense800k_dual_tmp/sensenova_si_und/parquet_info.json', # information of the parquet files
         },
         'mindcube_raw_qa': {
-            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube_raw_qa_qwen_sft/mindcube',
-            'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube_raw_qa_qwen_sft/parquet_info.json',
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube10k_raw_qa_shuffle_64group/mindcube',
+            'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube10k_raw_qa_shuffle_64group/parquet_info.json',
+        },
+        "spar-234k": {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_vgllm/vgllm_spar_234k', # path of the parquet files",
+            'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_vgllm/vgllm_spar_234k/parquet_info.json',
+        },
+        "spar-234k-mindcube_raw_qa": {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mix_spar234k-mindcube10k_raw_qa/mixed_mc_vgllm', # path of the parquet files",
+            'parquet_info_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mix_spar234k-mindcube10k_raw_qa/mixed_mc_vgllm/parquet_info.json',
         }
     },
     'recon_for_und':{
