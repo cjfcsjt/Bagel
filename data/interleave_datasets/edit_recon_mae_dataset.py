@@ -17,7 +17,7 @@ PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
 
 
 
-class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandardIterableDataset):
+class MAEMaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandardIterableDataset):
     """
     Masked reconstruction dataset for multi-view images.
     
@@ -166,20 +166,20 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
                 # ref image: full clean VAE + VIT condition
                 data = self._add_image(
                     data, img,
-                    need_loss=False,
-                    need_vae=True,
+                    need_loss=True,
+                    need_vae=False,
                     need_vit=True,
-                    vae_type="ref",
+                    vae_type="ref_noise",
                     enable_cfg=False,
                 )
             else:
                 # nonref image: clean VAE only (no VIT to avoid leaking masked regions)
                 data = self._add_image(
                     data, img,
-                    need_loss=False,
-                    need_vae=True,
+                    need_loss=True,
+                    need_vae=False,
                     need_vit=False,
-                    vae_type="nonref_clean",
+                    vae_type="nonref_noise",
                     enable_cfg=False,
                 )
 
@@ -189,15 +189,15 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
         #    These noise tokens attend to all preceding tokens (ref clean vae,
         #    ref vit, nonref masked clean vae) via attention for reconstruction.
         #    Note: nonref images have NO VIT in either pass to prevent leakage.
-        for img in nonref_images:
-            data = self._add_image(
-                data, img,
-                need_loss=True,   # mse loss on masked patches
-                need_vae=False,   # clean vae condition already added in first pass
-                need_vit=False,   # vit condition already added in first pass
-                vae_type="nonref_noise",
-                enable_cfg=False,
-            )
+        # for img in nonref_images:
+        #     data = self._add_image(
+        #         data, img,
+        #         need_loss=True,   # mse loss on masked patches
+        #         need_vae=False,   # clean vae condition already added in first pass
+        #         need_vit=False,   # vit condition already added in first pass
+        #         vae_type="nonref_noise",
+        #         enable_cfg=False,
+        #     )
 
         # 7. mask_ratio and mask_mode are now model attributes (BagelConfig),
         #    no longer passed from dataset.

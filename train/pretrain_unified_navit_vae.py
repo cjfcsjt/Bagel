@@ -345,6 +345,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable masked reconstruction mode for conditional generation."}
     )
+    use_mae_masking: bool = field(
+        default=False,
+        metadata={"help": "Enable masked autoencoder (MAE) style masking for conditional generation."}
+    )
     mask_mode: str = field(
         default=None,
         metadata={"help": "List of mask generation strategies, e.g. ['random', 'rectangle', 'blob']. "
@@ -532,6 +536,7 @@ def main():
         interpolate_pos=model_args.interpolate_pos,
         timestep_shift=training_args.timestep_shift,
         use_masking=training_args.use_masking,
+        use_mae_masking=training_args.use_mae_masking,
         mask_mode=training_args.mask_mode.split(',') if training_args.mask_mode else None,
         mask_ratio=[float(r) for r in training_args.mask_ratio.split(',')] if training_args.mask_ratio else None,
     )
@@ -732,9 +737,9 @@ def main():
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
-            # When use_masking is enabled (masked reconstruction), the model only returns
+            # When use_masking or use_mae_masking is enabled (masked reconstruction), the model only returns
             # MSE for masked tokens, so use actual tensor size for normalization.
-            if training_args.use_masking:
+            if training_args.use_masking or training_args.use_mae_masking:
                 total_mse_tokens = torch.tensor(mse.shape[0], device=device)
             else:
                 total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)
