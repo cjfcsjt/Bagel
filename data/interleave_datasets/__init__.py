@@ -3,4 +3,5 @@
 
 from .edit_dataset import UnifiedEditIterableDataset
 from .edit_recon_dataset import MaskedReconIterableDataset
+from .edit_recon_mae_dataset import MAEMaskedReconIterableDataset
 

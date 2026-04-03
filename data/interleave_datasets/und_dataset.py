@@ -16,7 +16,7 @@ import modeling.pi3.utils.cropping as cropping
 from modeling.pi3.utils.geometry import depthmap_to_absolute_camera_coordinates
 from .draw_marker import DRAW_FUNCTIONS
 import torch.distributed as dist
-import ast
+import json
 Image.MAX_IMAGE_PIXELS = 200000000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 MaximumDecompressedSize = 1024
@@ -64,6 +64,102 @@ class UndIterableDataset(ParquetStandardIterableDataset, DistributedIterableData
             raise ValueError(f"Unsupported data type: {data_item.get('type', None)}")
         draw_fn(image, data_item)
 
+    # ── 需要在图片上绘制标注的 spar 单图任务类型 ──
+    _SPAR_SINGLE_IMAGE_TYPES = {
+        "obj_spatial_relation_oo",
+        "depth_prediction_oc",
+        "depth_prediction_oo",
+        "distance_prediction_oc",
+        "distance_prediction_oo",
+        "distance_infer_center_oc",
+        "distance_infer_center_oo",
+        "spatial_volume_infer",
+        "spatial_imagination_oc",
+        "spatial_imagination_oo",
+    }
+
+    # ── 需要在图片上绘制标注的 spar 多图/视频任务类型 ──
+    _SPAR_MULTI_IMAGE_TYPES = {
+        "position_matching",
+        "view_change_infer",
+        "depth_prediction_oc_mv",
+        "depth_prediction_oo_mv",
+        "distance_prediction_oc_mv",
+        "distance_prediction_oo_mv",
+        "obj_spatial_relation_oc_mv",
+        "obj_spatial_relation_oo_mv",
+        "distance_infer_center_oc_mv",
+        "distance_infer_center_oo_mv",
+        "spatial_imagination_oc_mv",
+        "spatial_imagination_oo_mv",
+        "spatial_imagination_map_mv",
+        "camera_motion_infer",
+        "distance_prediction_oo_video",
+        "distance_infer_center_oo_video",
+        "spatial_imagination_oo_video",
+        "spatial_imagination_oc_video",
+        "spatial_imagination_oc_video_hard",
+        "spatial_imagination_oo_video_hard",
+        "obj_frame_locate",
+        "appearance_order",
+        "room_size",
+        "obj_count",
+        "nav",
+    }
+
+    def _load_vit_images(self, dataset_name, all_image_paths, row):
+        """
+        从 image_path 加载 VIT 分支所需的 PIL 图片列表。
+
+        根据数据集类型决定是否需要在图片上绘制标注（如 spar 数据集的
+        bounding-box / marker 等）。非 spar 数据集直接从文件路径读取为 RGB 图片。
+
+        Args:
+            dataset_name: 数据集名称，用于判断是否为 spar 系列。
+            all_image_paths: list[str]，图片文件路径。
+            row: 当前行数据，用于读取 metadata。
+
+        Returns:
+            list[PIL.Image.Image]: 加载（并可能绘制了标注）后的 RGB 图片列表。
+        """
+        if 'spar' not in dataset_name:
+            # 非 spar 数据集：直接从文件路径读取
+            return [pil_img2rgb(Image.open(p)) for p in all_image_paths]
+
+        # ── spar 数据集：需要根据 metadata 绘制标注 ──
+        try:
+            metadata = row['metadata']
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+
+            metadata = metadata['metadata']['spar_info']
+            # spar_info 可能仍是字符串（旧 Parquet 文件），兼容处理
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            task_type = metadata.get('type', None)
+            images = []
+            if len(all_image_paths) == 1:
+                assert task_type in self._SPAR_SINGLE_IMAGE_TYPES, f"Expected single-image task type, but got {task_type}"
+                try:
+                    image = Image.open(all_image_paths[0]).convert("RGB")
+                    self.draw_image(image, metadata)
+                    images.append(image)
+                except Exception as e:
+                    print(f"[WARN] draw_image failed | img_path={all_image_paths[0]} "
+                            f"| data_item_id={metadata.get('id', 'unk')} | error={e}")
+                return images
+            elif len(all_image_paths) > 1:
+                assert task_type in self._SPAR_MULTI_IMAGE_TYPES, f"Expected multi-image task type, but got {task_type}"
+                images = [Image.open(p).convert('RGB') for p in all_image_paths]
+                self.draw_image(images, metadata)   
+                return images
+            else:
+                raise ValueError(f"No images found in all_image_paths for task_type={task_type}")
+            
+        except Exception as e:
+            print(f'[WARN] _load_vit_images spar fallback: {e}')
+            print(f'  metadata={row.get("metadata", "N/A")}')
+            return [pil_img2rgb(Image.open(p)) for p in all_image_paths]
 
     def _crop_resize_if_necessary(self, image, depthmap, intrinsics, resolution, rng=None, info=None, normal=None, far_mask=None):
         """ This function:
@@ -545,13 +641,161 @@ class UndIterableDataset(ParquetStandardIterableDataset, DistributedIterableData
 
         return data
 
+    def _parse_row_video3dllm(self, row):
+        """
+        处理 video3dllm 数据集（VEGA-3D 五个数据集）。
+
+        Parquet 行中已包含离线预计算的 3D 数据：
+          - image_path:   所有帧的 RGB 图片路径
+          - depth_list:   所有帧的深度图路径
+          - poses:        所有帧的 cam2world 位姿（已 axis_align）
+          - depth_intrinsic: 深度内参
+          - world_coords: JSON 序列化的 (V, H, W, 3) 世界坐标
+          - boundary:     [x_min, x_max, y_min, y_max, z_min, z_max]
+          - objects:      JSON 序列化的物体框列表
+
+        在线处理：
+          1. 帧采样（_sample_view_indices）：从所有帧中采样 frame_num 帧
+          2. 从预计算的 world_coords 中取对应帧的子集
+          3. 加载采样帧的 RGB 图片（VIT 分支）
+          4. 构建 sequence_plan（仅 VIT 分支，与普通 und 数据集一致）
+
+        注意：question 中的 <image> token 数量固定为 1（VEGA-3D 格式），
+        而 VIT 分支加载的是采样后的多帧图片，因此需要将 question 中的
+        单个 <image> 替换为 frame_num 个 <image>。
+        """
+        question = row["question"]
+        answer = row["answer"]
+        dataset_name = row['dataset_name']
+        data_scene_name = row['scene_name']
+
+        try:
+            # ── Step 1: 读取离线预计算的 3D 数据 ──
+            all_image_paths = list(row['image_path'])
+            num_imgs = len(all_image_paths)
+
+            # 读取预计算的世界坐标
+            world_coords_json = row.get('world_coords', None)
+            boundary = row.get('boundary', None)
+            objects_json = row.get('objects', None)
+
+            has_3d = (world_coords_json is not None and world_coords_json != '')
+
+            # ── Step 2: 在线帧采样 ──
+            rng = np.random.default_rng(
+                abs(hash(row.get('metadata', '') + str(num_imgs))) % (2**31)
+            )
+
+            if num_imgs <= self.frame_num:
+                # 帧数不足，全部使用
+                idxs = list(range(num_imgs))
+            else:
+                max_distance = 20 if data_scene_name in ['scannet'] else 10
+                idxs = self._sample_view_indices(num_imgs, rng, max_distance=max_distance)
+
+            # ── Step 3: 取采样帧的图片路径 ──
+            sampled_image_paths = [all_image_paths[i] for i in idxs]
+            n_sampled = len(sampled_image_paths)
+
+            # ── Step 4: 从预计算的 world_coords 中取对应帧 ──
+            if has_3d:
+                try:
+                    world_coords_all = np.array(
+                        json.loads(world_coords_json), dtype=np.float32
+                    )  # (V_all, H, W, 3)
+                    world_coords_sampled = world_coords_all[idxs]  # (n_sampled, H, W, 3)
+                except Exception as e:
+                    print(f"[WARN] video3dllm: failed to parse world_coords: {e}")
+                    has_3d = False
+                    world_coords_sampled = None
+            else:
+                world_coords_sampled = None
+
+            # ── Step 5: 加载采样帧的 RGB 图片（VIT 分支） ──
+            raw_images = []
+            for img_path in sampled_image_paths:
+                try:
+                    raw_images.append(pil_img2rgb(Image.open(img_path)))
+                except Exception as e:
+                    print(f"[WARN] video3dllm: failed to load image {img_path}: {e}")
+                    return []
+
+            if not raw_images:
+                return []
+
+            # ── Step 6: 构建 question（将单个 <image> 替换为 n_sampled 个 <image>） ──
+            # VEGA-3D 的 question 格式：以单个 <image> 开头
+            # 我们需要将其替换为 n_sampled 个 <image>
+            if '<image>' in question:
+                # 替换第一个 <image> 为 n_sampled 个 <image>
+                question_with_frames = question.replace(
+                    '<image>',
+                    '<image>' * n_sampled,
+                    1  # 只替换第一个
+                )
+            else:
+                # 没有 <image> token，在开头添加
+                question_with_frames = '<image>' * n_sampled + '\n' + question
+
+            # ── Step 7: 构建 data dict ──
+            data = self._init_data()
+            data['img_per_seq'] = n_sampled
+            data['image_paths'] = sampled_image_paths
+
+            # 将 <image> 替换为 <vit_image>
+            text_with_images = question_with_frames.replace('<image>', '<vit_image>')
+            split_list = apply_template_qwenvl2_reconThenUnd(text_with_images, answer, task='und')
+
+            raw_images_queue = list(raw_images)
+
+            for item in split_list:
+                try:
+                    if item['type'] == 'text':
+                        data = self._add_text(data, item["value"], need_loss=item['loss'])
+                    elif item['type'] == 'vit':
+                        image, raw_images_queue = self.pop_first(raw_images_queue)
+                        dino_meta = {'scene_name': data_scene_name}
+                        data = self._add_image(
+                            data,
+                            image,
+                            dino_meta=dino_meta,
+                            need_loss=False,
+                            need_dino=False,
+                            need_vit=True,
+                        )
+                except AssertionError as e:
+                    print(e, 'skipping video3dllm row')
+                    return []
+
+            # ── Step 8: 附加 3D 信息到 data（供下游使用） ──
+            if has_3d and world_coords_sampled is not None:
+                data['video3dllm_world_coords'] = world_coords_sampled  # (n_sampled, H, W, 3)
+            if boundary is not None:
+                data['video3dllm_boundary'] = list(boundary)
+            if objects_json is not None and objects_json != '':
+                try:
+                    data['video3dllm_objects'] = json.loads(objects_json)
+                except Exception:
+                    data['video3dllm_objects'] = []
+
+            return data
+
+        except Exception as e:
+            print(f"[WARN] _parse_row_video3dllm failed: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
     def parse_row(self, row):
         question = row["question"]
         answer = row["answer"]
 
         data_scene_name = row['scene_name']
         dataset_name = row['dataset_name']
-        # rng = self._rng
+
+        # ── video3dllm 数据集：使用离线预计算的 3D 数据 + 在线帧采样 ──
+        if dataset_name.startswith('video3dllm'):
+            return self._parse_row_video3dllm(row)
 
         # ── Step 0: Extract scene metadata (pure metadata, no I/O) ──
         has_3d_annotation = (
@@ -615,86 +859,8 @@ class UndIterableDataset(ParquetStandardIterableDataset, DistributedIterableData
 
         # assert len(dino_images) > 0, f"No valid dino images found for scene {this_scene}"
 
-        # ── Step 3: Load VIT images (independent of dino sampling, uses all_image_paths) ──
-        vit_images_list = []
-        if 'spar' in dataset_name:
-            try:
-                metadata = row['metadata']
-                if not isinstance(metadata, dict):
-                    safe_context = {
-                        "array": np.array,
-                        "object": object,
-                        "None": None,
-                        "null": None,
-                    }
-                    metadata = eval(metadata, safe_context)
-            
-                image_types = {
-                    "obj_spatial_relation_oo",
-                    "depth_prediction_oc",
-                    "depth_prediction_oo",
-                    "distance_prediction_oc",
-                    "distance_prediction_oo",
-                    "distance_infer_center_oc",
-                    "distance_infer_center_oo",
-                    "spatial_volume_infer",
-                    "spatial_imagination_oc",
-                    "spatial_imagination_oo",
-                }
-                images_type = {
-                    "position_matching",
-                    "view_change_infer",
-                    "depth_prediction_oc_mv",
-                    "depth_prediction_oo_mv",
-                    "distance_prediction_oc_mv",
-                    "distance_prediction_oo_mv",
-                    "obj_spatial_relation_oc_mv",
-                    "obj_spatial_relation_oo_mv",
-                    "distance_infer_center_oc_mv",
-                    "distance_infer_center_oo_mv",
-                    "spatial_imagination_oc_mv",
-                    "spatial_imagination_oo_mv",
-                    "spatial_imagination_map_mv",
-                    "camera_motion_infer",
-                    "distance_prediction_oo_video",
-                    "distance_infer_center_oo_video",
-                    "spatial_imagination_oo_video",
-                    "spatial_imagination_oc_video",
-                    "spatial_imagination_oc_video_hard",
-                    "spatial_imagination_oo_video_hard",
-                    "obj_frame_locate",
-                    "appearance_order",
-                    "room_size",
-                    "obj_count",
-                    "nav",
-                }
-                if metadata['type'] in image_types:
-                    for i, img_path in enumerate(all_image_paths):
-                        try:
-                            image = Image.open(img_path).convert("RGB") 
-                            self.draw_image(image, metadata)
-                            vit_images_list.append(image)
-                        except Exception as e:
-                            error_print_once(e, f"| img_path={img_path} | data_item_id={metadata.get('id', 'unk')}")
-                elif metadata['type'] in images_type:
-                    images = [Image.open(p).convert('RGB') for p in all_image_paths]
-                    self.draw_image(images, metadata)
-                    vit_images_list = images
-                    
-                raw_images = vit_images_list
-            except Exception as e:
-                print('e', e)
-                print('metadata', metadata)
-                print('row:', row)
-                raw_images = [
-                    pil_img2rgb(Image.open(image))
-                    for image in all_image_paths
-                ]
-        else:
-            raw_images = [
-                    pil_img2rgb(Image.open(image))
-                    for image in all_image_paths
-                ]
+        # ── Step 3: Load VIT images (根据数据集类型决定是否绘制标注) ──
+        raw_images = self._load_vit_images(dataset_name, all_image_paths, row)
 
         # ── Step 4: Shuffle view order (dino branch only, vit is independent) ──
         # if self.shuffle_seq_views:
@@ -714,6 +880,7 @@ class UndIterableDataset(ParquetStandardIterableDataset, DistributedIterableData
 
         # Build template: dino images + question with vit images
         # question = '<image>' * len(raw_images) + question
+        # question = question.replace('<image>\n', '<image>')
         num_vit_tokens = question.count('<image>')
         assert num_vit_tokens == len(raw_images), f"num_vit_tokens={num_vit_tokens}, len(raw_images)={len(raw_images)}"
 
@@ -736,37 +903,37 @@ class UndIterableDataset(ParquetStandardIterableDataset, DistributedIterableData
             try:
                 if item['type'] == 'text':
                     data = self._add_text(data, item["value"], need_loss=item['loss'])
-                elif item['type'] == 'dino':
-                    image, dino_images_queue = self.pop_first(dino_images_queue)
-                    depth_map, dino_depths_queue = self.pop_first(dino_depths_queue)
-                    extri, dino_extrinsics_queue = self.pop_first(dino_extrinsics_queue)
-                    intri, dino_intrinsics_queue = self.pop_first(dino_intrinsics_queue)
-                    this_view_info, dino_view_infos_queue = self.pop_first(dino_view_infos_queue)
+                # elif item['type'] == 'dino':
+                #     image, dino_images_queue = self.pop_first(dino_images_queue)
+                #     depth_map, dino_depths_queue = self.pop_first(dino_depths_queue)
+                #     extri, dino_extrinsics_queue = self.pop_first(dino_extrinsics_queue)
+                #     intri, dino_intrinsics_queue = self.pop_first(dino_intrinsics_queue)
+                #     this_view_info, dino_view_infos_queue = self.pop_first(dino_view_infos_queue)
 
-                    dino_meta = {
-                        'scene_name': data_scene_name,
-                        'depth_map': depth_map,
-                        'extri_opencv': extri,
-                        'intrinsic_': intri,
-                    }
+                #     dino_meta = {
+                #         'scene_name': data_scene_name,
+                #         'depth_map': depth_map,
+                #         'extri_opencv': extri,
+                #         'intrinsic_': intri,
+                #     }
 
-                    # Determine split_start/split_end for bi-directional attention across all dino images
-                    is_split_start = (dino_counter == 0)
-                    is_split_end = (dino_counter == total_dino_count - 1)
-                    dino_counter += 1
-                    data = self._add_image(
-                        data, 
-                        image,
-                        dino_meta=dino_meta,
-                        need_loss=False, 
-                        need_dino=True, 
-                        need_vit=False, 
-                        rng=rng,
-                        view_info=this_view_info,
-                        has_3d_annotation=has_3d_annotation,
-                        split_start=is_split_start,
-                        split_end=is_split_end,
-                    )
+                #     # Determine split_start/split_end for bi-directional attention across all dino images
+                #     is_split_start = (dino_counter == 0)
+                #     is_split_end = (dino_counter == total_dino_count - 1)
+                #     dino_counter += 1
+                #     data = self._add_image(
+                #         data, 
+                #         image,
+                #         dino_meta=dino_meta,
+                #         need_loss=False, 
+                #         need_dino=True, 
+                #         need_vit=False, 
+                #         rng=rng,
+                #         view_info=this_view_info,
+                #         has_3d_annotation=has_3d_annotation,
+                #         split_start=is_split_start,
+                #         split_end=is_split_end,
+                #     )
                 elif item['type'] == 'vit':
                     image, raw_images = self.pop_first(raw_images)
                     dino_meta = {'scene_name': data_scene_name}
