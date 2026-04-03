@@ -107,6 +107,33 @@ DATASET_INFO = {
 			'num_total_samples': 50000
 		},
     },
+    'videollm3d': {
+        'scanqa': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/',
+            'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/processed/scanqa_train_llava_style.json',
+            'num_total_samples': 30000,
+        },
+        'sqa3d': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/',
+            'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/processed/sqa3d_train_llava_style.json',
+            'num_total_samples': 30000,
+        },
+        'scan2cap': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/',
+            'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/processed/scan2cap_train_llava_style.json',
+            'num_total_samples': 30000,
+        },
+        'scanrefer': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/',
+            'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/processed/scanrefer_vg_train_llava_style.json',
+            'num_total_samples': 30000,
+        },
+        'multi3drefer': {
+            'data_dir': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/',
+            'jsonl_path': '/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/processed/multi3drefer_train_llava_style.json',
+            'num_total_samples': 30000,
+        },
+    },
 	'recon_then_und':{
 		'spatial_mix': {
 			'data_dir': "/apdcephfs_303747097/share_303747097/jingfanchen/data/sft/unified_parquets_mindcube10/mindcube",

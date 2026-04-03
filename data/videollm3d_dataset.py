@@ -27,9 +27,9 @@ import numpy as np
 import torch
 from PIL import Image, ImageFile, PngImagePlugin
 
-from data.video_utils import VideoProcessor, merge_video_dict
-from data.data_utils import pil_img2rgb, apply_template_qwenvl2
-from data.distributed_iterable_dataset import DistributedIterableDataset
+from .video_utils import VideoProcessor, merge_video_dict
+from .data_utils import pil_img2rgb, apply_template_qwenvl2
+from .distributed_iterable_dataset import DistributedIterableDataset
 
 Image.MAX_IMAGE_PIXELS = 200000000
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -234,7 +234,19 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         shuffle_seed:             随机种子
         task_grouped_shuffle:     是否启用 VEGA-3D task-grouped shuffle
         batch_size:               每个 rank 的 batch size
-        video_processor_config:   VideoProcessor 配置 dict
+        video_folder:             视频数据根目录
+        annotation_dir:           embodiedscan 标注目录
+        metadata_dir:             元数据目录（box json 等）
+        voxel_size:               体素大小
+        min_xyz_range:            世界坐标最小范围
+        max_xyz_range:            世界坐标最大范围
+        frame_sampling_strategy:  帧采样策略（uniform / mc）
+        val_box_type:             验证集 box 类型（gt / pred）
+        force_sample:             是否强制采样指定帧数
+        frames_upbound:           强制采样时的帧数上限
+        generative_model_id:      生成式特征模型 ID
+        generative_feature_source: 生成式特征来源（offline / none）
+        add_spatial_instruction:  是否添加空间推理提示
     """
 
     def __init__(
@@ -253,7 +265,20 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         shuffle_seed=0,
         task_grouped_shuffle=True,
         batch_size=4,
-        video_processor_config=None,
+        # ── VideoProcessor 扁平参数（直接从 YAML 传入） ──
+        video_folder='data',
+        annotation_dir='data/embodiedscan/',
+        metadata_dir='data/metadata/',
+        voxel_size=0.1,
+        min_xyz_range=None,
+        max_xyz_range=None,
+        frame_sampling_strategy='uniform',
+        val_box_type='pred',
+        force_sample=False,
+        frames_upbound=0,
+        generative_model_id=None,
+        generative_feature_source='none',
+        add_spatial_instruction=False,
     ):
         super().__init__(dataset_name, local_rank, world_size, num_workers)
         self.vit_transform = vit_transform
@@ -266,22 +291,25 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         self._epoch_counter = 0
 
         # ── 初始化 VideoProcessor ──
-        vp_config = video_processor_config or {}
+        if min_xyz_range is None:
+            min_xyz_range = [-15, -15, -5]
+        if max_xyz_range is None:
+            max_xyz_range = [15, 15, 5]
         self.video_processor = VideoProcessor(
-            video_folder=vp_config.get('video_folder', 'data'),
-            annotation_dir=vp_config.get('annotation_dir', 'data/embodiedscan/'),
-            metadata_dir=vp_config.get('metadata_dir', 'data/metadata/'),
-            voxel_size=vp_config.get('voxel_size', 0.1),
-            min_xyz_range=vp_config.get('min_xyz_range', [-15, -15, -5]),
-            max_xyz_range=vp_config.get('max_xyz_range', [15, 15, 5]),
-            frame_sampling_strategy=vp_config.get('frame_sampling_strategy', 'uniform'),
-            val_box_type=vp_config.get('val_box_type', 'pred'),
+            video_folder=video_folder,
+            annotation_dir=annotation_dir,
+            metadata_dir=metadata_dir,
+            voxel_size=voxel_size,
+            min_xyz_range=min_xyz_range,
+            max_xyz_range=max_xyz_range,
+            frame_sampling_strategy=frame_sampling_strategy,
+            val_box_type=val_box_type,
         )
-        self.force_sample = vp_config.get('force_sample', False)
-        self.frames_upbound = vp_config.get('frames_upbound', 0)
-        self.generative_model_id = vp_config.get('generative_model_id', None)
-        self.generative_feature_source = vp_config.get('generative_feature_source', 'none')
-        self.add_spatial_instruction = vp_config.get('add_spatial_instruction', False)
+        self.force_sample = force_sample
+        self.frames_upbound = frames_upbound
+        self.generative_model_id = generative_model_id
+        self.generative_feature_source = generative_feature_source
+        self.add_spatial_instruction = add_spatial_instruction
 
         self.data_paths = self.get_data_paths(
             jsonl_path_list,
@@ -724,22 +752,6 @@ def main():
     tokenizer = MockTokenizer()
     frame_sampler = MockFrameSampler()
 
-    video_processor_config = {
-        'video_folder': args.data_dir,
-        'annotation_dir': os.path.join(args.data_dir, 'metadata'),
-        'metadata_dir': os.path.join(args.data_dir, 'metadata'),
-        'voxel_size': 0.1,
-        'min_xyz_range': [-15, -15, -5],
-        'max_xyz_range': [15, 15, 5],
-        'frame_sampling_strategy': args.strategy,
-        'val_box_type': 'pred',
-        'force_sample': False,
-        'frames_upbound': 0,
-        'generative_model_id': None,
-        'generative_feature_source': args.generative_feature_source,
-        'add_spatial_instruction': False,
-    }
-
     print("\n[1/3] 初始化 VideoLLM3DIterableDataset ...")
     dataset = VideoLLM3DIterableDataset(
         dataset_name="videollm3d_debug",
@@ -756,7 +768,20 @@ def main():
         shuffle_seed=42,
         task_grouped_shuffle=True,
         batch_size=4,
-        video_processor_config=video_processor_config,
+        # ── VideoProcessor 扁平参数 ──
+        video_folder=args.data_dir,
+        annotation_dir=args.annotation_dir,
+        metadata_dir=os.path.join(args.data_dir, 'metadata'),
+        voxel_size=0.1,
+        min_xyz_range=[-15, -15, -5],
+        max_xyz_range=[15, 15, 5],
+        frame_sampling_strategy=args.strategy,
+        val_box_type='pred',
+        force_sample=False,
+        frames_upbound=0,
+        generative_model_id=None,
+        generative_feature_source=args.generative_feature_source,
+        add_spatial_instruction=False,
     )
     print(f"  数据集大小: {len(dataset.data_paths)} 条")
     print(f"  每 rank 数据: {len(dataset.data_paths_per_rank)} 条")

@@ -137,3 +137,44 @@ und:
 #   num_used_data:
 #   - 3628218
 #   weight: 1
+
+videollm3d:
+  dataset_names:
+  - scanqa
+  - sqa3d
+  - scan2cap
+  - scanrefer
+  - multi3drefer
+  vit_image_transform_args:
+    image_stride: 14
+    max_image_size: 384
+    min_image_size: 384
+    max_pixels: 2_007_040
+  frame_sampler_args:
+    max_num_frames: 12
+    min_num_frames: 8
+  is_mandatory: True
+  shuffle_seed: 42
+  task_grouped_shuffle: True
+  batch_size: 4
+  num_used_data:
+  - 30000   # scanqa
+  - 30000   # sqa3d
+  - 30000   # scan2cap
+  - 30000   # scanrefer
+  - 30000   # multi3drefer
+  # ── VideoProcessor 扁平参数 ──
+  video_folder: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/
+  annotation_dir: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/embodiedscan/
+  metadata_dir: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/metadata/
+  voxel_size: 0.1
+  min_xyz_range: [-15, -15, -5]
+  max_xyz_range: [15, 15, 5]
+  frame_sampling_strategy: uniform
+  val_box_type: pred
+  force_sample: false
+  frames_upbound: 0
+  generative_model_id: null
+  generative_feature_source: none
+  add_spatial_instruction: false
+  weight: 1.0

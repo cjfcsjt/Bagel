@@ -233,6 +233,7 @@ class VideoProcessor:
         val_box_type='pred',
     ):
         self.video_folder = video_folder
+        self.metadata_dir = metadata_dir
         self.voxel_size = voxel_size
         self.min_xyz_range = torch.tensor(min_xyz_range) if min_xyz_range is not None else None
         self.max_xyz_range = torch.tensor(max_xyz_range) if max_xyz_range is not None else None
