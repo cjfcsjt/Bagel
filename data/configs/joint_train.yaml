@@ -1,28 +1,28 @@
 
-recon_for_und:
-  dataset_names:
-  - mindcube_raw_qa
-  dino_image_transform_args:
-    # image_stride: 14
-    # max_image_size: 518
-    # min_image_size: 518
-    # max_pixels: 2_007_040
-    # mode='crop'
-    target_size: 518
-  vit_image_transform_args:
-    image_stride: 14
-    image_size_h: 768  
-    image_size_w: 768 
-    max_pixels: 2_007_040
-  is_mandatory: True 
-  num_used_data:
-  # - 100000
-  - 1000
-  weight: 0.5
+# recon_for_und:
+#   dataset_names:
+#   - mindcube_raw_qa
+#   dino_image_transform_args:
+#     # image_stride: 14
+#     # max_image_size: 518
+#     # min_image_size: 518
+#     # max_pixels: 2_007_040
+#     # mode='crop'
+#     target_size: 518
+#   vit_image_transform_args:
+#     image_stride: 14
+#     image_size_h: 768  
+#     image_size_w: 768 
+#     max_pixels: 2_007_040
+#   is_mandatory: True 
+#   num_used_data:
+#   # - 100000
+#   - 1000
+#   weight: 0.5
 
 # und:
 #   dataset_names:
-#   - mindcube_raw_qa
+#   - spar-234k-mindcube_raw_qa
 #   # dino_image_transform_args:
 #     # image_stride: 14
 #     # max_image_size: 518
@@ -32,8 +32,8 @@ recon_for_und:
 #     # target_size: 518
 #   vit_image_transform_args:
 #     image_stride: 14
-#     max_image_size: 980
-#     min_image_size: 378
+#     max_image_size: 518
+#     min_image_size: 518
 #     max_pixels: 2_007_040
 #   image_transform_args:
 #     image_stride: 14
@@ -42,11 +42,35 @@ recon_for_und:
 #     max_pixels: 2_007_040
 #   is_mandatory: True 
 #   num_used_data:
-#   # - 100000
-#   - 1000
-#   weight: 0.5
+#   - 88    # ← 对应 mindcube_raw_qa, (parquet 1, 10k)，取 200 个 parquet 文件
+#   weight: 1.0
 
-# recon:
+und:
+  dataset_names:
+  - mindcube_raw_qa
+  # dino_image_transform_args:
+    # image_stride: 14
+    # max_image_size: 518
+    # min_image_size: 518
+    # max_pixels: 2_007_040
+    # mode='crop'
+    # target_size: 518
+  vit_image_transform_args:
+    image_stride: 14
+    max_image_size: 980
+    min_image_size: 378
+    max_pixels: 2_007_040
+  image_transform_args:
+    image_stride: 14
+    max_image_size: 980
+    min_image_size: 378
+    max_pixels: 2_007_040
+  is_mandatory: True 
+  num_used_data:
+  - 4    # ← 对应 mindcube_raw_qa, (parquet 1, 10k)，取 200 个 parquet 文件
+  weight: 0.5
+
+# mae_recon:
 #   dataset_names:
 #   - re10k
 #   # dino_image_transform_args:
