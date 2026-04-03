@@ -319,6 +319,42 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         )
         self.set_epoch()
 
+    def set_epoch(self, seed=42):
+        """
+        重写父类的 set_epoch，保留 task-grouped shuffle 的跨 rank 分配策略。
+
+        父类 DistributedIterableDataset.set_epoch() 会先 sorted() 再 rng.shuffle()，
+        这会完全破坏 get_data_paths() 中 task_grouped_shuffle 精心排列的顺序。
+
+        VEGA-3D 的设计意图：
+          - task_grouped_shuffle 中 _split_to_even_chunks 将每个 megabatch 按长度
+            均匀分成 world_size 份，排列为 [chunk0, chunk1, ..., chunk_{ws-1}]
+          - DistributedSampler 按步长取数据（rank i 取 index i, i+ws, i+2*ws, ...）
+          - 这样同一 megabatch 内，各 rank 拿到长度相近的数据
+
+        Bagel 的 IterableDataset 使用连续切片分发（而非步长取数），因此这里改为：
+          - 直接使用 get_data_paths() 已排好的顺序（不再 sorted + shuffle）
+          - 按步长 world_size 交错分配给各 rank（模拟 DistributedSampler 的行为）
+          - 这样 _split_to_even_chunks 的分配效果得以保留
+        """
+        if self.data_paths is None:
+            return
+
+        data_paths = self.data_paths
+
+        # ── 按步长交错分配（模拟 DistributedSampler）──
+        # rank i 取 index i, i+world_size, i+2*world_size, ...
+        # 这与 _split_to_even_chunks 的输出布局匹配：
+        #   megabatch 内排列为 [chunk0_item0, chunk1_item0, ..., chunk0_item1, chunk1_item1, ...]
+        self.data_paths_per_rank = data_paths[self.local_rank::self.world_size]
+        self.num_files_per_rank = len(self.data_paths_per_rank)
+
+        print(
+            f"[VideoLLM3D] set_epoch: rank-{self.local_rank}/{self.world_size}, "
+            f"总数据 {len(data_paths)}, 本 rank 分配 {self.num_files_per_rank} 条 "
+            f"(步长交错分配，保留 task-grouped 顺序)"
+        )
+
     def get_data_paths(
         self,
         jsonl_path_list,
@@ -545,13 +581,24 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                     continue
 
                 # ── VIT 图像编码 ──
+                # 使用 ImageTransform (VAE版) 接口：输入单个 PIL.Image, 返回 tensor (C, H, W)
                 if raw_images:
                     for raw_image in raw_images:
-                        image_tensor, image_grid_thw = self.vit_transform(
-                            [raw_image], img_num=len(raw_images)
-                        )
+                        image_tensor = self.vit_transform(raw_image)
                         image_tensor_list.append(image_tensor)
-                        image_grid_thw_list.append(image_grid_thw[0])
+                        # 从 tensor shape (C, H, W) 构造 grid_thw
+                        if image_tensor.dim() == 3:
+                            _, h, w = image_tensor.shape
+                            h_patches = h // 14  # patch_size=14（SigLIP）
+                            w_patches = w // 14
+                            image_grid_thw_list.append(
+                                torch.tensor([1, h_patches, w_patches])
+                            )
+                        else:
+                            # 已经是 (num_patches, dim) 格式
+                            image_grid_thw_list.append(
+                                torch.tensor([1, 1, image_tensor.shape[0]])
+                            )
                         num_tokens += image_tensor.shape[0] // 4
 
                 # ── 文本模板处理 ──
