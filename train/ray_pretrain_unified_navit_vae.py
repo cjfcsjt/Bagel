@@ -495,6 +495,10 @@ def train_func(config: dict):
         wandb.config.update(vars(training_args))
         wandb.config.update(vars(model_args))
         wandb.config.update(vars(data_args))
+        # 保存训练脚本和数据集配置文件到 wandb，方便复现
+        wandb.save(os.path.abspath(__file__), policy="now")
+        wandb.save(os.path.abspath(data_args.dataset_config_file), policy="now")
+        wandb.save(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "dataset_info.py"), policy="now")
         if training_args.peak_device_tflops > 0:
             logger.info(f"Using peak_device_tflops={training_args.peak_device_tflops:.2f} TFLOPs (per GPU).")
         else:
