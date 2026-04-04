@@ -19,7 +19,7 @@ runtime_env = {
         "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
         "HF_HOME": os.environ.get("HF_HOME", ""),
     },
-    "py_executable": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python",
+    "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/",
 
 }
 # 初始化 Ray 集群连接
