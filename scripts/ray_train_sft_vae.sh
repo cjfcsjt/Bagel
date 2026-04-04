@@ -5,7 +5,7 @@
 # =====================================================================
 
 # Data path settings
-export HOME=/apdcephfs_303747097/share_303747097/jingfanchen/
+export HOME=/mnt/group/jingfanchen/
 cd $HOME/code/Bagel
 export PYTHONPATH="$HOME/code/Bagel:$PYTHONPATH"
 export HF_HOME=$HOME/.cache/huggingface
@@ -15,27 +15,27 @@ export WANDB_API_KEY="wandb_v1_Xte4EnV3nuQ3BzkDzWKILPJ2lcx_R5cFqSxdClpufeWWLWdic
 export WANDB_ENTITY="jingfan-chen"  # 你的wandb用户名
 export WANDB_PROJECT="bagel-sft-training-sh"     # 你可以选择一个项目名
 
-# Thread settings
-export OMP_NUM_THREADS=1
-export MKL_NUM_THREADS=1
-export OPENBLAS_NUM_THREADS=1
-export NUMEXPR_NUM_THREADS=1
-export TORCH_NUM_THREADS=1
+# # Thread settings
+# export OMP_NUM_THREADS=1
+# export MKL_NUM_THREADS=1
+# export OPENBLAS_NUM_THREADS=1
+# export NUMEXPR_NUM_THREADS=1
+# export TORCH_NUM_THREADS=1
 
-# CUDA settings
-export DISABLE_ADDMM_CUDA_LT=1
-export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+# # CUDA settings
+# export DISABLE_ADDMM_CUDA_LT=1
+# export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
+# export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
-# NCCL settings
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_DEBUG="WARN"
-export NCCL_BLOCKING_WAIT=1
-# export NCCL_SOCKET_IFNAME="bond0"
-# export NCCL_NET_PLUGIN=none
-export NCCL_IB_HCA="mlx5_0"
-export NCCL_P2P_LEVEL="NVL"
+# # NCCL settings
+# export NCCL_ASYNC_ERROR_HANDLING=1
+# export NCCL_DEBUG="WARN"
+# export NCCL_BLOCKING_WAIT=1
+# # export NCCL_SOCKET_IFNAME="bond0"
+# # export NCCL_NET_PLUGIN=none
+# export NCCL_IB_HCA="mlx5_0"
+# export NCCL_P2P_LEVEL="NVL"
 
 RUNID=145
 
