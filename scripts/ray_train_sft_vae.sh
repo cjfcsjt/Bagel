@@ -93,4 +93,4 @@ export RAY_ADDRESS="172.16.4.24:6380"  # TODO: 替换为你的 Head 节点 IP
   --lr 2e-5 \
   --max_latent_size 64  \
   --wandb_runid ${RUNID} \
-  --num_workers 2 # use small num_workers since the num_used_data (10) are not enough to split
+  --num_workers 8 # use small num_workers since the num_used_data (10) are not enough to split
