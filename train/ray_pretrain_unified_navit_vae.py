@@ -3,7 +3,27 @@
 #
 # 基于 Ray Train (TorchTrainer) 的分布式训练脚本
 # 用法: python train/ray_pretrain_unified_navit_vae.py --num_ray_workers 8 ...
+# 设置环境变量，确保每个 worker 继承
+import ray
+runtime_env = {
+    "env_vars": {
+        "PATH": "/mnt/group/jingfanchen/miniconda3/bin:/mnt/group/jingfanchen/miniconda3/condabin:" + os.environ.get("PATH", ""),
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+        "NCCL_ASYNC_ERROR_HANDLING": os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
+        "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+        "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
+        "WANDB_API_KEY": os.environ.get("WANDB_API_KEY", ""),
+        "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", ""),
+        "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
+        "HF_HOME": os.environ.get("HF_HOME", ""),
+    },
+    "py_executable": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python",
 
+}
+# 初始化 Ray 集群连接
+ray.init(address="auto", runtime_env=runtime_env)
+    
 import functools
 import gc
 import os
@@ -948,28 +968,6 @@ def train_func(config: dict):
 def main():
     parser = HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    # 设置环境变量，确保每个 worker 继承
-    runtime_env = {
-        "env_vars": {
-            "PATH": "/mnt/group/jingfanchen/miniconda3/bin:/mnt/group/jingfanchen/miniconda3/condabin:" + os.environ.get("PATH", ""),
-            "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
-            "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-            "NCCL_ASYNC_ERROR_HANDLING": os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
-            "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
-            "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
-            "WANDB_API_KEY": os.environ.get("WANDB_API_KEY", ""),
-            "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", ""),
-            "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
-            "HF_HOME": os.environ.get("HF_HOME", ""),
-        },
-        "py_executable": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python",
-
-    }
-    # 初始化 Ray 集群连接
-    if training_args.ray_address:
-        ray.init(address=training_args.ray_address, runtime_env=runtime_env)
-    else:
-        ray.init(runtime_env=runtime_env)
 
     print(f"[Ray] 集群资源: {ray.cluster_resources()}")
     print(f"[Ray] 启动 {training_args.num_ray_workers} 个 worker，"
