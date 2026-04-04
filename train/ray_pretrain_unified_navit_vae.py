@@ -1030,7 +1030,10 @@ def train_func(config: dict):
             optimizer.zero_grad()
         
         # ---- 日志记录 ----
-        if curr_step % training_args.log_every == 0:
+        # 只在 gradient accumulation 的最后一个 micro_step 才记录日志，
+        # 避免同一个 curr_step 被重复记录（导致 wandb warning 和 ray iteration 膨胀）
+        is_accumulation_boundary = (micro_step + 1) % training_args.gradient_accumulation_steps == 0
+        if is_accumulation_boundary and curr_step % training_args.log_every == 0:
             total_samples = torch.tensor(len(data['sample_lens']), device=device)
             dist.all_reduce(total_samples, op=dist.ReduceOp.SUM)
 
@@ -1077,15 +1080,6 @@ def train_func(config: dict):
             if global_rank == 0:
                 wandb.log(wandb_log, step=curr_step)
 
-            # 通过 ray.train.report 上报指标（可选，用于 Ray Dashboard 监控）
-            ray.train.report(metrics={
-                "step": curr_step,
-                "ce_loss": wandb_log.get("ce", 0.0),
-                "mse_loss": wandb_log.get("mse", 0.0),
-                "mfu": mfu_value,
-                "tokens_per_sec": tokens_per_sec,
-            })
-
             start_time = time()
             token_window = 0.0
             seqlen_square_window = 0.0
@@ -1099,7 +1093,13 @@ def train_func(config: dict):
             data_status[item['dataset_name']][item['worker_id']] = item['data_indexes']
 
         # ---- 保存 checkpoint ----
-        if curr_step > 0 and curr_step % training_args.save_every == 0:
+        # ray.train.report 放在 save 时调用（降频），避免每步都做跨 worker 同步
+        if is_accumulation_boundary and curr_step > 0 and curr_step % training_args.save_every == 0:
+            ray.train.report(metrics={
+                "step": curr_step,
+                "mfu": mfu_value,
+                "tokens_per_sec": tokens_per_sec,
+            })
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             if global_rank == 0:
