@@ -70,7 +70,7 @@ python train/ray_pretrain_unified_navit_vae.py \
   --num_shard 16 \
   --cpu_offload False \
   --use_flex True \
-  --results_dir ./results \
+  --results_dir $HOME/code/Bagel/results \
   --checkpoint_dir $HOME/code/ckpt/joint_vae_und_video3dllm_${RUNID} \
   --save_every 200 \
   --log_every 1 \
