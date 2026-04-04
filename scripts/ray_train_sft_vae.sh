@@ -71,11 +71,11 @@ python train/ray_pretrain_unified_navit_vae.py \
   --cpu_offload False \
   --use_flex True \
   --results_dir ./results \
-  --checkpoint_dir $HOME/code/ckpt/joint_vae_geo_und_mindcube10k_raw_qa_shuffle_64group_${RUNID} \
+  --checkpoint_dir $HOME/code/ckpt/joint_vae_und_video3dllm_${RUNID} \
   --save_every 200 \
   --log_every 1 \
   --gradient_accumulation_steps 2 \
   --lr 2e-5 \
-  --max_latent_size 64  \  
+  --max_latent_size 64  \
   --wandb_runid ${RUNID} \
   --num_workers 2 # use small num_workers since the num_used_data (10) are not enough to split
