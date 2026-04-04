@@ -569,140 +569,140 @@ def train_func(config: dict):
     llm_config.qk_norm = model_args.llm_qk_norm
     llm_config.tie_word_embeddings = model_args.tie_word_embeddings
     llm_config.freeze_und = training_args.freeze_und
-    # if training_args.finetune_from_hf:
-    #     language_model = Qwen2ForCausalLM(llm_config)
-    # else:
-    #     language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
-    # if training_args.copy_init_moe:
-    #     language_model.init_moe()
+    if training_args.finetune_from_hf:
+        language_model = Qwen2ForCausalLM(llm_config)
+    else:
+        language_model = Qwen2ForCausalLM.from_pretrained(model_args.llm_path, config=llm_config)
+    if training_args.copy_init_moe:
+        language_model.init_moe()
 
-    # if training_args.visual_und:  
-    #     if training_args.finetune_from_hf:
-    #         vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
-    #     else:
-    #         vit_config = SiglipVisionConfig.from_pretrained(model_args.vit_path)
-    #     vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
-    #     vit_config.rope = model_args.vit_rope
-    #     if training_args.finetune_from_hf:
-    #         vit_model = SiglipVisionModel(vit_config)
-    #     else:
-    #         vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
+    if training_args.visual_und:  
+        if training_args.finetune_from_hf:
+            vit_config = SiglipVisionConfig.from_json_file(os.path.join(model_args.model_path, "vit_config.json"))
+        else:
+            vit_config = SiglipVisionConfig.from_pretrained(model_args.vit_path)
+        vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
+        vit_config.rope = model_args.vit_rope
+        if training_args.finetune_from_hf:
+            vit_model = SiglipVisionModel(vit_config)
+        else:
+            vit_model = SiglipVisionModel.from_pretrained(model_args.vit_path, config=vit_config)
 
-    # if training_args.visual_gen:
-    #     vae_model, vae_config = load_ae(
-    #         local_path=os.path.join(model_args.model_path, "ae.safetensors") 
-    #         if training_args.finetune_from_hf else model_args.vae_path
-    #     )
+    if training_args.visual_gen:
+        vae_model, vae_config = load_ae(
+            local_path=os.path.join(model_args.model_path, "ae.safetensors") 
+            if training_args.finetune_from_hf else model_args.vae_path
+        )
 
-    # bagel_config = BagelConfig(
-    #     visual_gen=training_args.visual_gen,
-    #     visual_und=training_args.visual_und,
-    #     llm_config=llm_config, 
-    #     vit_config=vit_config if training_args.visual_und else None,
-    #     vae_config=vae_config if training_args.visual_gen else None,
-    #     latent_patch_size=model_args.latent_patch_size,
-    #     max_latent_size=model_args.max_latent_size,
-    #     vit_max_num_patch_per_side=model_args.vit_max_num_patch_per_side,
-    #     connector_act=model_args.connector_act,
-    #     interpolate_pos=model_args.interpolate_pos,
-    #     timestep_shift=training_args.timestep_shift,
-    #     use_masking=training_args.use_masking,
-    #     use_mae_masking=training_args.use_mae_masking,
-    #     mask_mode=training_args.mask_mode.split(',') if training_args.mask_mode else None,
-    #     mask_ratio=[float(r) for r in training_args.mask_ratio.split(',')] if training_args.mask_ratio else None,
-    # )
-    # model = Bagel(
-    #     language_model, 
-    #     vit_model if training_args.visual_und else None, 
-    #     bagel_config
-    # )
+    bagel_config = BagelConfig(
+        visual_gen=training_args.visual_gen,
+        visual_und=training_args.visual_und,
+        llm_config=llm_config, 
+        vit_config=vit_config if training_args.visual_und else None,
+        vae_config=vae_config if training_args.visual_gen else None,
+        latent_patch_size=model_args.latent_patch_size,
+        max_latent_size=model_args.max_latent_size,
+        vit_max_num_patch_per_side=model_args.vit_max_num_patch_per_side,
+        connector_act=model_args.connector_act,
+        interpolate_pos=model_args.interpolate_pos,
+        timestep_shift=training_args.timestep_shift,
+        use_masking=training_args.use_masking,
+        use_mae_masking=training_args.use_mae_masking,
+        mask_mode=training_args.mask_mode.split(',') if training_args.mask_mode else None,
+        mask_ratio=[float(r) for r in training_args.mask_ratio.split(',')] if training_args.mask_ratio else None,
+    )
+    model = Bagel(
+        language_model, 
+        vit_model if training_args.visual_und else None, 
+        bagel_config
+    )
 
-    # if training_args.visual_und:
-    #     model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
+    if training_args.visual_und:
+        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(vit_config)
 
-    # total_param_count = count_parameters(model)
-    # lm_param_count = count_parameters(model.language_model)
-    # logger.info(f"Model parameter count: {total_param_count / 1e9:.2f}B (LM-only: {lm_param_count / 1e9:.2f}B)")
+    total_param_count = count_parameters(model)
+    lm_param_count = count_parameters(model.language_model)
+    logger.info(f"Model parameter count: {total_param_count / 1e9:.2f}B (LM-only: {lm_param_count / 1e9:.2f}B)")
 
     # ---- Tokenizer ----
     tokenizer = Qwen2Tokenizer.from_pretrained(model_args.model_path if training_args.finetune_from_hf else model_args.llm_path)
     tokenizer, new_token_ids, num_new_tokens = add_special_tokens(tokenizer)
-    # if num_new_tokens > 0:
-    #     model.language_model.resize_token_embeddings(len(tokenizer))
-    #     model.config.llm_config.vocab_size = len(tokenizer)
-    #     model.language_model.config.vocab_size = len(tokenizer)
+    if num_new_tokens > 0:
+        model.language_model.resize_token_embeddings(len(tokenizer))
+        model.config.llm_config.vocab_size = len(tokenizer)
+        model.language_model.config.vocab_size = len(tokenizer)
 
     # ---- 冻结模块 ----
-    # if training_args.freeze_vae and training_args.visual_gen:
-    #     for param in vae_model.parameters():
-    #         param.requires_grad = False
-    # if training_args.freeze_llm:
-    #     model.language_model.eval()
-    #     for param in model.language_model.parameters():
-    #         param.requires_grad = False
-    # if training_args.freeze_vit and training_args.visual_und:
-    #     model.vit_model.eval()
-    #     for param in model.vit_model.parameters():
-    #         param.requires_grad = False
+    if training_args.freeze_vae and training_args.visual_gen:
+        for param in vae_model.parameters():
+            param.requires_grad = False
+    if training_args.freeze_llm:
+        model.language_model.eval()
+        for param in model.language_model.parameters():
+            param.requires_grad = False
+    if training_args.freeze_vit and training_args.visual_und:
+        model.vit_model.eval()
+        for param in model.vit_model.parameters():
+            param.requires_grad = False
 
-    # # ---- FSDP 封装 & 加载预训练权重 ----
-    # fsdp_config = FSDPConfig(
-    #     sharding_strategy=training_args.sharding_strategy,
-    #     backward_prefetch=training_args.backward_prefetch,
-    #     cpu_offload=training_args.cpu_offload,
-    #     num_replicate=training_args.num_replicate,
-    #     num_shard=training_args.num_shard,
-    # )
-    # ema_model = deepcopy(model)
-    # model, ema_model = FSDPCheckpoint.try_load_ckpt(
-    #     resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
-    # )
-    # ema_model = fsdp_ema_setup(ema_model, fsdp_config)
-    # fsdp_model = fsdp_wrapper(model, fsdp_config)
-    # apply_activation_checkpointing(
-    #     fsdp_model, 
-    #     checkpoint_wrapper_fn=functools.partial(
-    #         checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
-    #     ), 
-    #     check_fn=grad_checkpoint_check_fn
-    # )
+    # ---- FSDP 封装 & 加载预训练权重 ----
+    fsdp_config = FSDPConfig(
+        sharding_strategy=training_args.sharding_strategy,
+        backward_prefetch=training_args.backward_prefetch,
+        cpu_offload=training_args.cpu_offload,
+        num_replicate=training_args.num_replicate,
+        num_shard=training_args.num_shard,
+    )
+    ema_model = deepcopy(model)
+    model, ema_model = FSDPCheckpoint.try_load_ckpt(
+        resume_from, logger, model, ema_model, resume_from_ema=finetune_from_ema
+    )
+    ema_model = fsdp_ema_setup(ema_model, fsdp_config)
+    fsdp_model = fsdp_wrapper(model, fsdp_config)
+    apply_activation_checkpointing(
+        fsdp_model, 
+        checkpoint_wrapper_fn=functools.partial(
+            checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+        ), 
+        check_fn=grad_checkpoint_check_fn
+    )
 
-    # if global_rank == 0:
-    #     print(fsdp_model)
-    #     for name, param in model.named_parameters():
-    #         print(name, param.requires_grad)
+    if global_rank == 0:
+        print(fsdp_model)
+        for name, param in model.named_parameters():
+            print(name, param.requires_grad)
 
-    # # ---- 优化器 & 调度器 ----
-    # optimizer = torch.optim.AdamW(
-    #     fsdp_model.parameters(), 
-    #     lr=training_args.lr, 
-    #     betas=(training_args.beta1, training_args.beta2), 
-    #     eps=training_args.eps, 
-    #     weight_decay=0
-    # )
-    # if training_args.lr_scheduler == 'cosine':
-    #     scheduler = get_cosine_with_min_lr_schedule_with_warmup(
-    #         optimizer=optimizer,
-    #         num_warmup_steps=training_args.warmup_steps,
-    #         num_training_steps=training_args.total_steps,
-    #         min_lr=training_args.min_lr,
-    #     )
-    # elif training_args.lr_scheduler == 'constant':
-    #     scheduler = get_constant_schedule_with_warmup(
-    #         optimizer=optimizer, num_warmup_steps=training_args.warmup_steps
-    #     )
-    # else:
-    #     raise ValueError(f"Unknown lr_scheduler: {training_args.lr_scheduler}")
+    # ---- 优化器 & 调度器 ----
+    optimizer = torch.optim.AdamW(
+        fsdp_model.parameters(), 
+        lr=training_args.lr, 
+        betas=(training_args.beta1, training_args.beta2), 
+        eps=training_args.eps, 
+        weight_decay=0
+    )
+    if training_args.lr_scheduler == 'cosine':
+        scheduler = get_cosine_with_min_lr_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=training_args.warmup_steps,
+            num_training_steps=training_args.total_steps,
+            min_lr=training_args.min_lr,
+        )
+    elif training_args.lr_scheduler == 'constant':
+        scheduler = get_constant_schedule_with_warmup(
+            optimizer=optimizer, num_warmup_steps=training_args.warmup_steps
+        )
+    else:
+        raise ValueError(f"Unknown lr_scheduler: {training_args.lr_scheduler}")
 
-    # # ---- 恢复优化器/调度器/训练步数 ----
-    data_status = None
-    # if resume_model_only:
-    #     train_step = 0
-    #     data_status = None
-    # else:
-    #     optimizer, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
-    #         resume_from, optimizer, scheduler, fsdp_config, 
-    #     )
+    # ---- 恢复优化器/调度器/训练步数 ----
+
+    if resume_model_only:
+        train_step = 0
+        data_status = None
+    else:
+        optimizer, scheduler, train_step, data_status = FSDPCheckpoint.try_load_train_state(
+            resume_from, optimizer, scheduler, fsdp_config, 
+        )
 
     # ---- 数据集 & DataLoader ----
     with open(data_args.dataset_config_file, "r") as stream:
@@ -750,192 +750,192 @@ def train_func(config: dict):
     #  不需要加载模型权重，只需要 tokenizer + 数据集
     #  设置环境变量 DEBUG_DATA=1 启用，DEBUG_DATA_MAX_BATCHES=N 控制检查批次数
     # ═══════════════════════════════════════════════════════════════════
-    if training_args.use_flex:
-        from data.data_utils import create_sparse_mask
-        from torch.nn.attention.flex_attention import create_block_mask
+    # if training_args.use_flex:
+    #     from data.data_utils import create_sparse_mask
+    #     from torch.nn.attention.flex_attention import create_block_mask
 
-        debug_max_batches = int(os.environ.get("DEBUG_DATA_MAX_BATCHES", "10000"))
-        debug_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        # 从 llm_config 获取 num_heads（与 bagel.py 中 self.num_heads 一致）
-        debug_num_heads = llm_config.num_attention_heads
+    #     debug_max_batches = int(os.environ.get("DEBUG_DATA_MAX_BATCHES", "10000"))
+    #     debug_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    #     # 从 llm_config 获取 num_heads（与 bagel.py 中 self.num_heads 一致）
+    #     debug_num_heads = llm_config.num_attention_heads
 
-        logger.info(f"[DEBUG_DATA] 开始遍历数据集检查 attention mask（最多 {debug_max_batches} 个 batch）...")
-        logger.info(f"[DEBUG_DATA] max_num_tokens={data_args.max_num_tokens}, num_heads={debug_num_heads}")
+    #     logger.info(f"[DEBUG_DATA] 开始遍历数据集检查 attention mask（最多 {debug_max_batches} 个 batch）...")
+    #     logger.info(f"[DEBUG_DATA] max_num_tokens={data_args.max_num_tokens}, num_heads={debug_num_heads}")
 
-        debug_error_count = 0
-        debug_ok_count = 0
+    #     debug_error_count = 0
+    #     debug_ok_count = 0
 
-        for debug_batch_idx, debug_data in enumerate(train_loader):
-            if debug_batch_idx >= debug_max_batches:
-                break
+    #     for debug_batch_idx, debug_data in enumerate(train_loader):
+    #         if debug_batch_idx >= debug_max_batches:
+    #             break
 
-            debug_data = debug_data.to_dict()
-            sequence_length = debug_data.get('sequence_length', 0)
-            sample_lens = debug_data.get('sample_lens', [])
-            split_lens = debug_data.get('split_lens', [])
-            attn_modes = debug_data.get('attn_modes', [])
+    #         debug_data = debug_data.to_dict()
+    #         sequence_length = debug_data.get('sequence_length', 0)
+    #         sample_lens = debug_data.get('sample_lens', [])
+    #         split_lens = debug_data.get('split_lens', [])
+    #         attn_modes = debug_data.get('attn_modes', [])
 
-            # ── 基本一致性检查 ──
-            sum_sample_lens = sum(sample_lens) if sample_lens else 0
-            sum_split_lens = sum(split_lens) if split_lens else 0
+    #         # ── 基本一致性检查 ──
+    #         sum_sample_lens = sum(sample_lens) if sample_lens else 0
+    #         sum_split_lens = sum(split_lens) if split_lens else 0
 
-            has_issue = False
-            issue_msgs = []
+    #         has_issue = False
+    #         issue_msgs = []
 
-            if sum_sample_lens != sum_split_lens:
-                issue_msgs.append(
-                    f"sum(sample_lens)={sum_sample_lens} != sum(split_lens)={sum_split_lens}"
-                )
-                has_issue = True
+    #         if sum_sample_lens != sum_split_lens:
+    #             issue_msgs.append(
+    #                 f"sum(sample_lens)={sum_sample_lens} != sum(split_lens)={sum_split_lens}"
+    #             )
+    #             has_issue = True
 
-            if sum_sample_lens != sequence_length:
-                issue_msgs.append(
-                    f"sum(sample_lens)={sum_sample_lens} != sequence_length={sequence_length}"
-                )
-                has_issue = True
+    #         if sum_sample_lens != sequence_length:
+    #             issue_msgs.append(
+    #                 f"sum(sample_lens)={sum_sample_lens} != sequence_length={sequence_length}"
+    #             )
+    #             has_issue = True
 
-            if len(split_lens) != len(attn_modes):
-                issue_msgs.append(
-                    f"len(split_lens)={len(split_lens)} != len(attn_modes)={len(attn_modes)}"
-                )
-                has_issue = True
+    #         if len(split_lens) != len(attn_modes):
+    #             issue_msgs.append(
+    #                 f"len(split_lens)={len(split_lens)} != len(attn_modes)={len(attn_modes)}"
+    #             )
+    #             has_issue = True
 
-            # 检查是否有非法的 attn_mode
-            valid_modes = {'causal', 'full', 'noise'}
-            for mode in attn_modes:
-                if mode not in valid_modes:
-                    issue_msgs.append(f"非法 attn_mode: '{mode}'")
-                    has_issue = True
+    #         # 检查是否有非法的 attn_mode
+    #         valid_modes = {'causal', 'full', 'noise'}
+    #         for mode in attn_modes:
+    #             if mode not in valid_modes:
+    #                 issue_msgs.append(f"非法 attn_mode: '{mode}'")
+    #                 has_issue = True
 
-            # 检查 split_lens 中是否有 0 或负数
-            for i, sl in enumerate(split_lens):
-                if sl <= 0:
-                    issue_msgs.append(f"split_lens[{i}]={sl} <= 0")
-                    has_issue = True
+    #         # 检查 split_lens 中是否有 0 或负数
+    #         for i, sl in enumerate(split_lens):
+    #             if sl <= 0:
+    #                 issue_msgs.append(f"split_lens[{i}]={sl} <= 0")
+    #                 has_issue = True
 
-            # 检查 sample_lens 中是否有 0 或负数
-            for i, sl in enumerate(sample_lens):
-                if sl <= 0:
-                    issue_msgs.append(f"sample_lens[{i}]={sl} <= 0")
-                    has_issue = True
+    #         # 检查 sample_lens 中是否有 0 或负数
+    #         for i, sl in enumerate(sample_lens):
+    #             if sl <= 0:
+    #                 issue_msgs.append(f"sample_lens[{i}]={sl} <= 0")
+    #                 has_issue = True
 
-            # 检查 sum(sample_lens) 是否等于 max_num_tokens
-            if sum_sample_lens != data_args.max_num_tokens:
-                issue_msgs.append(
-                    f"sum(sample_lens)={sum_sample_lens} != max_num_tokens={data_args.max_num_tokens}"
-                )
-                has_issue = True
+    #         # 检查 sum(sample_lens) 是否等于 max_num_tokens
+    #         if sum_sample_lens != data_args.max_num_tokens:
+    #             issue_msgs.append(
+    #                 f"sum(sample_lens)={sum_sample_lens} != max_num_tokens={data_args.max_num_tokens}"
+    #             )
+    #             has_issue = True
 
-            # 检查 BLOCK_SIZE 对齐：create_block_mask 内部 triton kernel 会 round up 到 BLOCK_SIZE 的倍数
-            # 如果 sum(sample_lens) 不是 BLOCK_SIZE 的倍数，triton kernel 可能用超出范围的索引调用 mask 函数
-            BLOCK_SIZE = 128
-            if sum_sample_lens % BLOCK_SIZE != 0:
-                rounded_up = ((sum_sample_lens + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-                issue_msgs.append(
-                    f"⚠️ sum(sample_lens)={sum_sample_lens} 不是 BLOCK_SIZE={BLOCK_SIZE} 的倍数, "
-                    f"triton kernel 会 round up 到 {rounded_up}, "
-                    f"mask 函数中的张量(长度{sum_sample_lens})可能被越界访问"
-                )
-                # 这是一个 warning，不一定导致错误（取决于 PyTorch 版本），但标记为 issue
-                has_issue = True
+    #         # 检查 BLOCK_SIZE 对齐：create_block_mask 内部 triton kernel 会 round up 到 BLOCK_SIZE 的倍数
+    #         # 如果 sum(sample_lens) 不是 BLOCK_SIZE 的倍数，triton kernel 可能用超出范围的索引调用 mask 函数
+    #         BLOCK_SIZE = 128
+    #         if sum_sample_lens % BLOCK_SIZE != 0:
+    #             rounded_up = ((sum_sample_lens + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+    #             issue_msgs.append(
+    #                 f"⚠️ sum(sample_lens)={sum_sample_lens} 不是 BLOCK_SIZE={BLOCK_SIZE} 的倍数, "
+    #                 f"triton kernel 会 round up 到 {rounded_up}, "
+    #                 f"mask 函数中的张量(长度{sum_sample_lens})可能被越界访问"
+    #             )
+    #             # 这是一个 warning，不一定导致错误（取决于 PyTorch 版本），但标记为 issue
+    #             has_issue = True
 
-            # 检查 packed_text_indexes 是否越界
-            if 'packed_text_indexes' in debug_data:
-                pti = debug_data['packed_text_indexes']
-                if hasattr(pti, 'max') and len(pti) > 0:
-                    max_idx = pti.max().item()
-                    if max_idx >= sum_sample_lens:
-                        issue_msgs.append(
-                            f"packed_text_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
-                        )
-                        has_issue = True
+    #         # 检查 packed_text_indexes 是否越界
+    #         if 'packed_text_indexes' in debug_data:
+    #             pti = debug_data['packed_text_indexes']
+    #             if hasattr(pti, 'max') and len(pti) > 0:
+    #                 max_idx = pti.max().item()
+    #                 if max_idx >= sum_sample_lens:
+    #                     issue_msgs.append(
+    #                         f"packed_text_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+    #                     )
+    #                     has_issue = True
 
-            # 检查 packed_vit_token_indexes 是否越界
-            if 'packed_vit_token_indexes' in debug_data:
-                pvti = debug_data['packed_vit_token_indexes']
-                if hasattr(pvti, 'max') and len(pvti) > 0:
-                    max_idx = pvti.max().item()
-                    if max_idx >= sum_sample_lens:
-                        issue_msgs.append(
-                            f"packed_vit_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
-                        )
-                        has_issue = True
+    #         # 检查 packed_vit_token_indexes 是否越界
+    #         if 'packed_vit_token_indexes' in debug_data:
+    #             pvti = debug_data['packed_vit_token_indexes']
+    #             if hasattr(pvti, 'max') and len(pvti) > 0:
+    #                 max_idx = pvti.max().item()
+    #                 if max_idx >= sum_sample_lens:
+    #                     issue_msgs.append(
+    #                         f"packed_vit_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+    #                     )
+    #                     has_issue = True
 
-            # 检查 packed_vae_token_indexes 是否越界
-            if 'packed_vae_token_indexes' in debug_data:
-                pvati = debug_data['packed_vae_token_indexes']
-                if hasattr(pvati, 'max') and len(pvati) > 0:
-                    max_idx = pvati.max().item()
-                    if max_idx >= sum_sample_lens:
-                        issue_msgs.append(
-                            f"packed_vae_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
-                        )
-                        has_issue = True
+    #         # 检查 packed_vae_token_indexes 是否越界
+    #         if 'packed_vae_token_indexes' in debug_data:
+    #             pvati = debug_data['packed_vae_token_indexes']
+    #             if hasattr(pvati, 'max') and len(pvati) > 0:
+    #                 max_idx = pvati.max().item()
+    #                 if max_idx >= sum_sample_lens:
+    #                     issue_msgs.append(
+    #                         f"packed_vae_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+    #                     )
+    #                     has_issue = True
 
-            # ── 尝试构造 create_sparse_mask + create_block_mask ──
-            mask_error = None
-            if split_lens and attn_modes:
-                try:
-                    sparse_mask = create_sparse_mask(
-                        sample_lens, split_lens, attn_modes, debug_device
-                    )
-                    seqlen = sum(sample_lens)
-                    block_mask = create_block_mask(
-                        sparse_mask, B=1, H=debug_num_heads,
-                        Q_LEN=seqlen, KV_LEN=seqlen,
-                        device=debug_device, BLOCK_SIZE=128, _compile=True
-                    )
-                except Exception as e:
-                    mask_error = str(e)
-                    has_issue = True
-                    issue_msgs.append(f"create_block_mask 异常: {mask_error}")
+    #         # ── 尝试构造 create_sparse_mask + create_block_mask ──
+    #         mask_error = None
+    #         if split_lens and attn_modes:
+    #             try:
+    #                 sparse_mask = create_sparse_mask(
+    #                     sample_lens, split_lens, attn_modes, debug_device
+    #                 )
+    #                 seqlen = sum(sample_lens)
+    #                 block_mask = create_block_mask(
+    #                     sparse_mask, B=1, H=debug_num_heads,
+    #                     Q_LEN=seqlen, KV_LEN=seqlen,
+    #                     device=debug_device, BLOCK_SIZE=128, _compile=True
+    #                 )
+    #             except Exception as e:
+    #                 mask_error = str(e)
+    #                 has_issue = True
+    #                 issue_msgs.append(f"create_block_mask 异常: {mask_error}")
 
-            if has_issue:
-                debug_error_count += 1
-                logger.error(f"[DEBUG_DATA] ❌ batch #{debug_batch_idx} 发现问题:")
-                for msg in issue_msgs:
-                    logger.error(f"  - {msg}")
-                logger.error(f"  sequence_length = {sequence_length}")
-                logger.error(f"  max_num_tokens  = {data_args.max_num_tokens}")
-                logger.error(f"  sample_lens ({len(sample_lens)}个) = {sample_lens}")
-                logger.error(f"  split_lens  ({len(split_lens)}个) = {split_lens}")
-                logger.error(f"  attn_modes  ({len(attn_modes)}个) = {attn_modes}")
-                logger.error(f"  sum(sample_lens) = {sum_sample_lens}")
-                logger.error(f"  sum(split_lens)  = {sum_split_lens}")
+    #         if has_issue:
+    #             debug_error_count += 1
+    #             logger.error(f"[DEBUG_DATA] ❌ batch #{debug_batch_idx} 发现问题:")
+    #             for msg in issue_msgs:
+    #                 logger.error(f"  - {msg}")
+    #             logger.error(f"  sequence_length = {sequence_length}")
+    #             logger.error(f"  max_num_tokens  = {data_args.max_num_tokens}")
+    #             logger.error(f"  sample_lens ({len(sample_lens)}个) = {sample_lens}")
+    #             logger.error(f"  split_lens  ({len(split_lens)}个) = {split_lens}")
+    #             logger.error(f"  attn_modes  ({len(attn_modes)}个) = {attn_modes}")
+    #             logger.error(f"  sum(sample_lens) = {sum_sample_lens}")
+    #             logger.error(f"  sum(split_lens)  = {sum_split_lens}")
 
-                # 检查各种 indexes 的详细信息
-                for idx_name in ['packed_text_indexes', 'packed_vit_token_indexes', 'packed_vae_token_indexes']:
-                    if idx_name in debug_data:
-                        idx_tensor = debug_data[idx_name]
-                        if hasattr(idx_tensor, 'max') and len(idx_tensor) > 0:
-                            logger.error(f"  {idx_name}: len={len(idx_tensor)}, min={idx_tensor.min().item()}, max={idx_tensor.max().item()}")
-            else:
-                debug_ok_count += 1
-                if debug_batch_idx % 10 == 0:
-                    logger.info(
-                        f"[DEBUG_DATA] ✅ batch #{debug_batch_idx} OK: "
-                        f"seqlen={sequence_length}, "
-                        f"samples={len(sample_lens)}, "
-                        f"splits={len(split_lens)}"
-                    )
+    #             # 检查各种 indexes 的详细信息
+    #             for idx_name in ['packed_text_indexes', 'packed_vit_token_indexes', 'packed_vae_token_indexes']:
+    #                 if idx_name in debug_data:
+    #                     idx_tensor = debug_data[idx_name]
+    #                     if hasattr(idx_tensor, 'max') and len(idx_tensor) > 0:
+    #                         logger.error(f"  {idx_name}: len={len(idx_tensor)}, min={idx_tensor.min().item()}, max={idx_tensor.max().item()}")
+    #         else:
+    #             debug_ok_count += 1
+    #             if debug_batch_idx % 10 == 0:
+    #                 logger.info(
+    #                     f"[DEBUG_DATA] ✅ batch #{debug_batch_idx} OK: "
+    #                     f"seqlen={sequence_length}, "
+    #                     f"samples={len(sample_lens)}, "
+    #                     f"splits={len(split_lens)}"
+    #                 )
 
-            # 清理 GPU 内存
-            del debug_data
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    #         # 清理 GPU 内存
+    #         del debug_data
+    #         if torch.cuda.is_available():
+    #             torch.cuda.empty_cache()
 
-        logger.info(f"[DEBUG_DATA] 检查完成: {debug_ok_count} 个 batch 正常, {debug_error_count} 个 batch 有问题")
-        if debug_error_count > 0:
-            logger.error(f"[DEBUG_DATA] 发现 {debug_error_count} 个有问题的 batch，请检查数据集！")
-        else:
-            logger.info(f"[DEBUG_DATA] 所有 {debug_ok_count} 个 batch 均通过检查 ✅")
+    #     logger.info(f"[DEBUG_DATA] 检查完成: {debug_ok_count} 个 batch 正常, {debug_error_count} 个 batch 有问题")
+    #     if debug_error_count > 0:
+    #         logger.error(f"[DEBUG_DATA] 发现 {debug_error_count} 个有问题的 batch，请检查数据集！")
+    #     else:
+    #         logger.info(f"[DEBUG_DATA] 所有 {debug_ok_count} 个 batch 均通过检查 ✅")
 
-        # debug 完成后退出，不进入训练循环
-        logger.info("[DEBUG_DATA] Debug 模式完成，退出程序。")
-        if global_rank == 0:
-            wandb.finish()
-        import sys
-        sys.exit(0)
+    #     # debug 完成后退出，不进入训练循环
+    #     logger.info("[DEBUG_DATA] Debug 模式完成，退出程序。")
+    #     if global_rank == 0:
+    #         wandb.finish()
+    #     import sys
+    #     sys.exit(0)
     # ═══════════════════════════════════════════════════════════════════
     #  DEBUG 结束
     # ═══════════════════════════════════════════════════════════════════
