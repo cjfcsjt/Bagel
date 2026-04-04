@@ -695,6 +695,7 @@ def train_func(config: dict):
     #     raise ValueError(f"Unknown lr_scheduler: {training_args.lr_scheduler}")
 
     # # ---- 恢复优化器/调度器/训练步数 ----
+    data_status = None
     # if resume_model_only:
     #     train_step = 0
     #     data_status = None
@@ -818,9 +819,62 @@ def train_func(config: dict):
                     issue_msgs.append(f"sample_lens[{i}]={sl} <= 0")
                     has_issue = True
 
+            # 检查 sum(sample_lens) 是否等于 max_num_tokens
+            if sum_sample_lens != data_args.max_num_tokens:
+                issue_msgs.append(
+                    f"sum(sample_lens)={sum_sample_lens} != max_num_tokens={data_args.max_num_tokens}"
+                )
+                has_issue = True
+
+            # 检查 BLOCK_SIZE 对齐：create_block_mask 内部 triton kernel 会 round up 到 BLOCK_SIZE 的倍数
+            # 如果 sum(sample_lens) 不是 BLOCK_SIZE 的倍数，triton kernel 可能用超出范围的索引调用 mask 函数
+            BLOCK_SIZE = 128
+            if sum_sample_lens % BLOCK_SIZE != 0:
+                rounded_up = ((sum_sample_lens + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+                issue_msgs.append(
+                    f"⚠️ sum(sample_lens)={sum_sample_lens} 不是 BLOCK_SIZE={BLOCK_SIZE} 的倍数, "
+                    f"triton kernel 会 round up 到 {rounded_up}, "
+                    f"mask 函数中的张量(长度{sum_sample_lens})可能被越界访问"
+                )
+                # 这是一个 warning，不一定导致错误（取决于 PyTorch 版本），但标记为 issue
+                has_issue = True
+
+            # 检查 packed_text_indexes 是否越界
+            if 'packed_text_indexes' in debug_data:
+                pti = debug_data['packed_text_indexes']
+                if hasattr(pti, 'max') and len(pti) > 0:
+                    max_idx = pti.max().item()
+                    if max_idx >= sum_sample_lens:
+                        issue_msgs.append(
+                            f"packed_text_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+                        )
+                        has_issue = True
+
+            # 检查 packed_vit_token_indexes 是否越界
+            if 'packed_vit_token_indexes' in debug_data:
+                pvti = debug_data['packed_vit_token_indexes']
+                if hasattr(pvti, 'max') and len(pvti) > 0:
+                    max_idx = pvti.max().item()
+                    if max_idx >= sum_sample_lens:
+                        issue_msgs.append(
+                            f"packed_vit_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+                        )
+                        has_issue = True
+
+            # 检查 packed_vae_token_indexes 是否越界
+            if 'packed_vae_token_indexes' in debug_data:
+                pvati = debug_data['packed_vae_token_indexes']
+                if hasattr(pvati, 'max') and len(pvati) > 0:
+                    max_idx = pvati.max().item()
+                    if max_idx >= sum_sample_lens:
+                        issue_msgs.append(
+                            f"packed_vae_token_indexes.max()={max_idx} >= sum(sample_lens)={sum_sample_lens}"
+                        )
+                        has_issue = True
+
             # ── 尝试构造 create_sparse_mask + create_block_mask ──
             mask_error = None
-            if not has_issue and split_lens and attn_modes:
+            if split_lens and attn_modes:
                 try:
                     sparse_mask = create_sparse_mask(
                         sample_lens, split_lens, attn_modes, debug_device
@@ -842,20 +896,19 @@ def train_func(config: dict):
                 for msg in issue_msgs:
                     logger.error(f"  - {msg}")
                 logger.error(f"  sequence_length = {sequence_length}")
+                logger.error(f"  max_num_tokens  = {data_args.max_num_tokens}")
                 logger.error(f"  sample_lens ({len(sample_lens)}个) = {sample_lens}")
                 logger.error(f"  split_lens  ({len(split_lens)}个) = {split_lens}")
                 logger.error(f"  attn_modes  ({len(attn_modes)}个) = {attn_modes}")
                 logger.error(f"  sum(sample_lens) = {sum_sample_lens}")
                 logger.error(f"  sum(split_lens)  = {sum_split_lens}")
 
-                # 检查 packed_text_indexes 是否越界
-                if 'packed_text_indexes' in debug_data:
-                    pti = debug_data['packed_text_indexes']
-                    if hasattr(pti, 'max') and len(pti) > 0:
-                        max_idx = pti.max().item()
-                        logger.error(f"  packed_text_indexes: max={max_idx}, len={len(pti)}")
-                        if max_idx >= sequence_length:
-                            logger.error(f"  ⚠️ packed_text_indexes.max()={max_idx} >= sequence_length={sequence_length}!")
+                # 检查各种 indexes 的详细信息
+                for idx_name in ['packed_text_indexes', 'packed_vit_token_indexes', 'packed_vae_token_indexes']:
+                    if idx_name in debug_data:
+                        idx_tensor = debug_data[idx_name]
+                        if hasattr(idx_tensor, 'max') and len(idx_tensor) > 0:
+                            logger.error(f"  {idx_name}: len={len(idx_tensor)}, min={idx_tensor.min().item()}, max={idx_tensor.max().item()}")
             else:
                 debug_ok_count += 1
                 if debug_batch_idx % 10 == 0:
