@@ -44,7 +44,7 @@ RUNID=145
 # --ray_address: 设为 "auto" 连接已有集群，或留空在本地启动
 # --num_ray_workers: 总 GPU worker 数（单机8卡=8，双机8卡=16）
 # =====================================================================
-python train/ray_pretrain_unified_navit_vae.py \
+/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python3.11 train/ray_pretrain_unified_navit_vae.py \
   --ray_address auto \
   --num_ray_workers 16 \
   --num_ray_gpus_per_worker 1 \
