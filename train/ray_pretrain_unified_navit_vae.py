@@ -3,12 +3,16 @@
 #
 # 基于 Ray Train (TorchTrainer) 的分布式训练脚本
 # 用法: python train/ray_pretrain_unified_navit_vae.py --num_ray_workers 8 ...
-# 设置环境变量，确保每个 worker 继承
+#
+# 前置条件：在每个节点上用 conda 环境启动独立的 Ray 集群（不同端口），例如：
+#   Head 节点: conda activate ray_py311 && ray start --head --port=6380 --dashboard-port=8266 --num-gpus=8
+#   Worker 节点: conda activate ray_py311 && ray start --address=<HEAD_IP>:6380 --num-gpus=8
+# 这样 Ray worker 进程天然使用 conda Python，无需 PYTHONPATH hack。
 import ray
 import os
+
 runtime_env = {
     "env_vars": {
-        "PATH": "/mnt/group/jingfanchen/miniconda3/bin:/mnt/group/jingfanchen/miniconda3/condabin:" + os.environ.get("PATH", ""),
         "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
         "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
         "NCCL_ASYNC_ERROR_HANDLING": os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
@@ -19,11 +23,11 @@ runtime_env = {
         "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
         "HF_HOME": os.environ.get("HF_HOME", ""),
     },
-    "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/",
-
 }
 # 初始化 Ray 集群连接
-ray.init(address="auto", runtime_env=runtime_env)
+# 通过 --ray_address 参数或 RAY_ADDRESS 环境变量指定你自己启动的 Ray 集群地址
+_ray_address = os.environ.get("RAY_ADDRESS", "auto")
+ray.init(address=_ray_address, runtime_env=runtime_env)
     
 import functools
 import gc

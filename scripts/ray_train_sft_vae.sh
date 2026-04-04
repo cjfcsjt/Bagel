@@ -40,12 +40,27 @@ export WANDB_PROJECT="bagel-sft-training-sh"     # 你可以选择一个项目�
 RUNID=145
 
 # =====================================================================
+# 前置步骤：在每个节点的 conda 环境中启动独立的 Ray 集群
+# （只需执行一次，之后可以反复提交训练任务）
+#
+# Head 节点（Pod 1）:
+#   source /mnt/group/jingfanchen/miniconda3/bin/activate ray_py311
+#   ray start --head --port=6380 --dashboard-port=8266 --num-gpus=8
+#
+# Worker 节点（Pod 2）:
+#   source /mnt/group/jingfanchen/miniconda3/bin/activate ray_py311
+#   ray start --address=<HEAD_IP>:6380 --num-gpus=8
+#
+# 然后设置 RAY_ADDRESS 指向你自己的 Ray 集群 head 地址
+# =====================================================================
+export RAY_ADDRESS="172.16.4.24:6380"  # TODO: 替换为你的 Head 节点 IP
+
+# =====================================================================
 # 使用 Ray Train 启动（替代 torchrun）
-# --ray_address: 设为 "auto" 连接已有集群，或留空在本地启动
 # --num_ray_workers: 总 GPU worker 数（单机8卡=8，双机8卡=16）
 # =====================================================================
 /mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python3.11 train/ray_pretrain_unified_navit_vae.py \
-  --ray_address auto \
+  --ray_address ${RAY_ADDRESS} \
   --num_ray_workers 16 \
   --num_ray_gpus_per_worker 1 \
   --num_ray_cpus_per_worker 8 \
