@@ -950,8 +950,8 @@ def main():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     # 设置环境变量，确保每个 worker 继承
     runtime_env = {
-        "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
         "env_vars": {
+            "PATH": "/mnt/group/jingfanchen/miniconda3/bin:/mnt/group/jingfanchen/miniconda3/condabin:" + os.environ.get("PATH", ""),
             "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
             "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
             "NCCL_ASYNC_ERROR_HANDLING": os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
@@ -962,6 +962,8 @@ def main():
             "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
             "HF_HOME": os.environ.get("HF_HOME", ""),
         },
+        "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
+
     }
     # 初始化 Ray 集群连接
     if training_args.ray_address:
