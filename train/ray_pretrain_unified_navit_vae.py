@@ -962,7 +962,7 @@ def main():
             "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
             "HF_HOME": os.environ.get("HF_HOME", ""),
         },
-        "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
+        "py_executable": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin/python",
 
     }
     # 初始化 Ray 集群连接
