@@ -5,6 +5,7 @@
 # 用法: python train/ray_pretrain_unified_navit_vae.py --num_ray_workers 8 ...
 # 设置环境变量，确保每个 worker 继承
 import ray
+import os
 runtime_env = {
     "env_vars": {
         "PATH": "/mnt/group/jingfanchen/miniconda3/bin:/mnt/group/jingfanchen/miniconda3/condabin:" + os.environ.get("PATH", ""),
