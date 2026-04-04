@@ -950,6 +950,7 @@ def main():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     # 设置环境变量，确保每个 worker 继承
     runtime_env = {
+        "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
         "env_vars": {
             "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
             "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
@@ -960,8 +961,6 @@ def main():
             "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", ""),
             "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
             "HF_HOME": os.environ.get("HF_HOME", ""),
-            "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
-            "PATH": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin:" + os.environ.get("PATH", "")
         },
     }
     # 初始化 Ray 集群连接
