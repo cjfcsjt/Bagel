@@ -51,8 +51,8 @@ python train/ray_pretrain_unified_navit_vae.py \
   --num_ray_cpus_per_worker 8 \
   --dataset_config_file ./data/configs/joint_train.yaml \
   --layer_module Qwen2MoTDecoderLayer \
-  --model_path /root/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
-  --resume-from /root/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
+  --model_path /mnt/group/jingfanchen/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
+  --resume-from /mnt/group/jingfanchen/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
   --max_latent_size 64 \
   --finetune_from_hf True \
   --auto_resume True \
