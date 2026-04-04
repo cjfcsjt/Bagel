@@ -986,13 +986,13 @@ def main():
     )
 
     # 构建 RunConfig（Ray Train 的运行配置）
-    run_config = RunConfig(
-        name=f"bagel-ray-{training_args.wandb_runid}",
-        storage_path=training_args.results_dir,
-        # checkpoint_config=CheckpointConfig(
-        #     num_to_keep=3,  # 保留最近 3 个 Ray checkpoint
-        # ),
-    )
+    # run_config = RunConfig(
+    #     name=f"bagel-ray-{training_args.wandb_runid}",
+    #     storage_path=training_args.results_dir,
+    #     # checkpoint_config=CheckpointConfig(
+    #     #     num_to_keep=3,  # 保留最近 3 个 Ray checkpoint
+    #     # ),
+    # )
 
     # 需要传递给每个 worker 的配置（序列化为 dict）
     train_loop_config = {
@@ -1006,7 +1006,7 @@ def main():
         train_loop_per_worker=train_func,
         train_loop_config=train_loop_config,
         scaling_config=scaling_config,
-        run_config=run_config,
+        # run_config=run_config,
         torch_config=ray.train.torch.TorchConfig(
             backend="nccl",
         ),
