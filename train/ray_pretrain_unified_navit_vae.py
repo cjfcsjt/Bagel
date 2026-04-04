@@ -960,6 +960,7 @@ def main():
             "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", ""),
             "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", ""),
             "HF_HOME": os.environ.get("HF_HOME", ""),
+            "conda": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311",
             "PATH": "/mnt/group/jingfanchen/miniconda3/envs/ray_py311/bin:" + os.environ.get("PATH", "")
         },
     }
