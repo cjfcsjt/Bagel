@@ -64,7 +64,7 @@ export RAY_ADDRESS="172.16.4.24:6380"  # TODO: 替换为你的 Head 节点 IP
   --num_ray_workers 16 \
   --num_ray_gpus_per_worker 1 \
   --num_ray_cpus_per_worker 8 \
-  --dataset_config_file ./data/configs/joint_train.yaml \
+  --dataset_config_file $HOME/code/Bagel/data/configs/joint_train.yaml \
   --layer_module Qwen2MoTDecoderLayer \
   --model_path /mnt/group/jingfanchen/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
   --resume-from /mnt/group/jingfanchen/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
