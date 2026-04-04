@@ -252,7 +252,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
     def __init__(
         self,
         dataset_name,
-        vit_transform,
+        transform,
         tokenizer,
         frame_sampler,
         jsonl_path_list,
@@ -281,7 +281,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         add_spatial_instruction=False,
     ):
         super().__init__(dataset_name, local_rank, world_size, num_workers)
-        self.vit_transform = vit_transform
+        self.transform = transform
         self.tokenizer = tokenizer
         self.frame_sampler = frame_sampler
         self.data_status = data_status
@@ -450,6 +450,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
             row_start_id = self.data_status[worker_id] + 1
         else:
             row_start_id = 0
+        transform_stride = self.transform.stride
 
         print(
             f"rank-{self.local_rank} worker-{worker_id} dataset-{self.dataset_name}: "
@@ -474,7 +475,6 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                 image_tensor_list = []
                 text_ids_list = []
                 sequence_plan = []
-                image_grid_thw_list = []
 
                 try:
                     data_item = json.loads(data)
@@ -584,22 +584,10 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                 # 使用 ImageTransform (VAE版) 接口：输入单个 PIL.Image, 返回 tensor (C, H, W)
                 if raw_images:
                     for raw_image in raw_images:
-                        image_tensor = self.vit_transform(raw_image)
+                        image_tensor = self.transform(raw_image, img_num=len(raw_images)) 
                         image_tensor_list.append(image_tensor)
-                        # 从 tensor shape (C, H, W) 构造 grid_thw
-                        if image_tensor.dim() == 3:
-                            _, h, w = image_tensor.shape
-                            h_patches = h // 14  # patch_size=14（SigLIP）
-                            w_patches = w // 14
-                            image_grid_thw_list.append(
-                                torch.tensor([1, h_patches, w_patches])
-                            )
-                        else:
-                            # 已经是 (num_patches, dim) 格式
-                            image_grid_thw_list.append(
-                                torch.tensor([1, 1, image_tensor.shape[0]])
-                            )
-                        num_tokens += image_tensor.shape[0] // 4
+                        height, width = image_tensor.shape[1:]
+                        num_tokens += width * height // transform_stride ** 2
 
                 # ── 文本模板处理 ──
                 question = data_item['conversations'][0]["value"]
@@ -642,7 +630,6 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                 result = dict(
                     image_tensor_list=image_tensor_list,
                     text_ids_list=text_ids_list,
-                    image_grid_thw_list=image_grid_thw_list,
                     sequence_plan=sequence_plan,
                     num_tokens=num_tokens,
                     data_indexes={
