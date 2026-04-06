@@ -19,23 +19,21 @@ PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
 
 class MAEMaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandardIterableDataset):
     """
-    Masked reconstruction dataset for multi-view images.
+    MAE-style masked reconstruction dataset for multi-view images.
     
     Data layout in the packed sequence (for one sample):
-        --- Pass 1: ALL images as clean condition (no loss) ---
-        [ref_1_vae_clean][ref_1_vit] ... [ref_K_vae_clean][ref_K_vit]
-        [nonref_1_vae_clean] ... [nonref_M_vae_clean]
-        --- Pass 2: nonref images as noise VAE (with loss) ---
-        [nonref_1_vae_noise] ... [nonref_M_vae_noise]
+        --- Pass 1: ALL images' VIT tokens as condition (no loss) ---
+        [ref_1_vit(ref_vit)] [ref_2_vit(ref_vit)] ... [nonref_1_vit(nonref_vit)] ...
+        --- Pass 2: ALL images' VAE noise tokens in video mode (with loss) ---
+        [ref_1_vae(ref_noise)] [ref_2_vae(ref_noise)] ... [nonref_1_vae(nonref_noise)] ...
+        (all VAE frames share one timestep, bidirectional attention between frames)
     
-    - ref images (pass 1):    need_vae=True, need_vit=True, need_loss=False
-      → fully visible clean condition tokens (VAE + VIT)
-    - nonref images (pass 1): need_vae=True, need_vit=False, need_loss=False
-      → clean VAE only; masked positions get learnable mask_placeholder in forward
-      → NO VIT to prevent information leakage of masked regions
-    - nonref images (pass 2): need_loss=True, need_vae=False, need_vit=False
-      → noise split (fully noised via flow-matching in forward);
-        attends to ALL preceding clean condition tokens for reconstruction
+    - VIT tokens (pass 1): ref_vit type → unmasked; nonref_vit type → masked in forward
+      All VIT tokens are in "full" attention splits, visible to all subsequent tokens.
+    - VAE noise tokens (pass 2): added via _add_video (video mode)
+      → all frames in one "full" split with frame_delta, sharing one timestep
+      → bidirectional attention between all VAE frames
+      → can attend to all preceding VIT condition tokens
     """
 
     def __init__(self, ref_num=2, max_frames=8, **kwargs):
@@ -155,49 +153,58 @@ class MAEMaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStand
 
         data = self._init_data()
 
-        # 5. First pass: add ALL images (ref + nonref) as clean condition (no loss)
-        #    - ref images: fully visible clean VAE + VIT condition
-        #    - nonref images: clean VAE only (no VIT!) — masked positions in clean VAE
-        #      will be replaced with learnable mask_placeholder in forward.
-        #      VIT is NOT added for nonref images to prevent information leakage
-        #      (VIT tokens are unmasked and would reveal the full image).
+        # 5. Pass 1: 按顺序添加所有图片的 VIT token 作为 condition（no loss）
+        #    - ref 图片: vit_type="ref_vit"，forward 中不做 masking
+        #    - nonref 图片: vit_type="nonref_vit"，forward 中对 masked 位置替换为 vit_mask_placeholder
+        #    每个 VIT 是独立的 "full" split，可以被后续所有 token 看到。
         for i, img in enumerate(images):
             if i < ref_num:
-                # ref image: full clean VAE + VIT condition
                 data = self._add_image(
                     data, img,
-                    need_loss=True,
+                    need_loss=False,
                     need_vae=False,
                     need_vit=True,
-                    vae_type="ref_noise",
+                    vit_type="ref_vit",
                     enable_cfg=False,
                 )
             else:
-                # nonref image: clean VAE only (no VIT to avoid leaking masked regions)
                 data = self._add_image(
                     data, img,
-                    need_loss=True,
+                    need_loss=False,
                     need_vae=False,
-                    need_vit=False,
-                    vae_type="nonref_noise",
+                    need_vit=True,
+                    vit_type="nonref_vit",
                     enable_cfg=False,
                 )
 
-        # 6. Second pass: add nonref images as noise VAE tokens (with loss)
-        #    need_vae=False, need_vit=False because clean condition copies
-        #    were already added in the first pass above.
-        #    These noise tokens attend to all preceding tokens (ref clean vae,
-        #    ref vit, nonref masked clean vae) via attention for reconstruction.
-        #    Note: nonref images have NO VIT in either pass to prevent leakage.
-        # for img in nonref_images:
-        #     data = self._add_image(
-        #         data, img,
-        #         need_loss=True,   # mse loss on masked patches
-        #         need_vae=False,   # clean vae condition already added in first pass
-        #         need_vit=False,   # vit condition already added in first pass
-        #         vae_type="nonref_noise",
-        #         enable_cfg=False,
-        #     )
+        # 6. Pass 2: 用 video 模式添加所有图片的 VAE noise token（with loss）
+        #    所有帧合并为一个 "full" split，共享同一个 timestep，帧间双向注意力。
+        #    这些 noised VAE token 可以看到前面所有的 VIT condition token。
+        #    ref 图片: vae_type="ref_noise"
+        #    nonref 图片: vae_type="nonref_noise"
+        #    注意：_add_video 中所有帧共用同一个 vae_type，
+        #    所以需要分别调用 ref 和 nonref，但仍然在同一个 video split 中。
+        #    这里我们手动构建 video split 来支持不同的 vae_type。
+        frame_indexes = list(range(len(images)))
+        for i, (img, frame_idx) in enumerate(zip(images, frame_indexes)):
+            vae_type = "ref_noise" if i < ref_num else "nonref_noise"
+            current_sequence_plan = {
+                'type': 'vae_image',
+                'enable_cfg': 0,
+                'loss': 1,
+                'special_token_loss': 0,
+                'special_token_label': None,
+                'vae_type': vae_type,
+                'split_start': i == 0,
+                'split_end': i == len(images) - 1,
+            }
+            if i < len(frame_indexes) - 1:
+                current_sequence_plan['frame_delta'] = frame_indexes[i + 1] - frame_idx
+            data['sequence_plan'].append(current_sequence_plan)
+            image_tensor = self.transform(img)
+            height, width = image_tensor.shape[1:]
+            data['image_tensor_list'].append(image_tensor)
+            data['num_tokens'] += width * height // self.transform.stride ** 2
 
         # 7. mask_ratio and mask_mode are now model attributes (BagelConfig),
         #    no longer passed from dataset.

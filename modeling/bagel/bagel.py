@@ -201,10 +201,15 @@ class Bagel(PreTrainedModel):
             self.use_mae_masking = config.use_mae_masking
             self.mask_mode = config.mask_mode
             self.mask_ratio = config.mask_ratio
-            if self.use_masking or self.use_mae_masking:
-                # Learnable placeholder embedding for masked positions in nonref clean VAE tokens.
-                # Note: nonref images have no VIT (excluded at data side), so no VIT placeholder needed.
+            if self.use_masking:
+                # Learnable placeholder embedding for masked positions (use_masking mode only).
                 self.vae_mask_placeholder = nn.Parameter(torch.zeros(self.hidden_size))
+            if self.use_mae_masking:
+                # Learnable placeholder for masked VIT tokens (nonref images).
+                # In MAE mode, nonref VIT tokens at masked spatial positions are replaced
+                # with this placeholder to prevent information leakage, while noised VAE
+                # tokens remain unmasked for flow-matching denoising training.
+                self.vit_mask_placeholder = nn.Parameter(torch.zeros(self.hidden_size))
 
         if config.visual_und:
             self.vit_model = vit_model
@@ -228,6 +233,8 @@ class Bagel(PreTrainedModel):
             nn.init.constant_(self.llm2vae.bias, 0)
             if self.use_masking:
                 nn.init.normal_(self.vae_mask_placeholder, std=0.02)
+            if self.use_mae_masking:
+                nn.init.normal_(self.vit_mask_placeholder, std=0.02)
 
     def forward(
         self,
@@ -246,6 +253,7 @@ class Bagel(PreTrainedModel):
         packed_vit_token_indexes: Optional[torch.LongTensor] = None,
         packed_vit_position_ids: Optional[torch.LongTensor] = None,
         vit_token_seqlens: Optional[torch.IntTensor] = None,
+        patchified_vit_latent_shapes: Optional[List[Tuple[int, int]]] = None,
         # for visual generation
         padded_latent: Optional[torch.Tensor] = None,
         patchified_vae_latent_shapes: Optional[List[Tuple[int, int]]] = None,
@@ -254,6 +262,7 @@ class Bagel(PreTrainedModel):
         packed_timesteps: Optional[torch.LongTensor] = None,
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
         packed_vae_types: Optional[List[str]] = None,
+        packed_vit_types: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -466,77 +475,25 @@ class Bagel(PreTrainedModel):
                 # (need_vit=False for nonref images in MaskedReconIterableDataset).
                 # Only ref images have VIT, preventing information leakage of masked regions.
             elif self.use_mae_masking and packed_vae_types is not None:
-                # === Masked Reconstruction Mode ===
+                # === MAE-style Masked Reconstruction Mode ===
                 #
-                # Data layout uses explicit vae_type labels from the dataset:
-                #   "ref"          — ref clean VAE (Pass 1 ref images, no loss)
-                #   "nonref_clean" — nonref clean VAE (Pass 1 nonref images, no loss)
-                #   "nonref_noise" — nonref noise VAE (Pass 2 nonref images, with loss)
+                # 设计：所有图片（ref + nonref）都有 noised VAE 和 VIT token。
+                #   - VIT token 作为 condition，nonref 的 VIT token 在 masked 位置
+                #     被替换为 vit_mask_placeholder，防止信息泄露。
+                #   - Noised VAE token 不做 masking，正常参与 flow-matching denoising 训练。
+                #   - 所有 VAE token 都算标准 velocity loss（和普通 t2i 一样）。
+                #   - 模型需要从 condition（含 masked VIT）中学会补全 masked 区域。
                 #
-                # Strategy:
-                # 1. Classify VAE images by packed_vae_types labels
-                # 2. Generate spatial masks for each nonref image
-                # 3. Noise VAE: fully noised via flow-matching (entire image, not just masked)
-                #    — the model sees visible parts through the nonref clean VAE condition
-                # 4. Nonref clean VAE: replace masked positions with vae_mask_placeholder
-                #
-                # Note: nonref images have NO VIT tokens (removed at data side to prevent
-                # information leakage). Only ref images have VIT tokens.
+                # Data layout:
+                #   先添加所有图片的 VIT token（ref_vit / nonref_vit），
+                #   再用 video 模式添加所有 VAE noise token（共享 timestep，帧间双向注意力）。
+                #   VIT 和 VAE 通过 packed_vit_types / packed_vae_types 区分 ref/nonref。
 
                 i = random.randint(0, len(self.mask_mode) - 1)
                 cur_mode = self.mask_mode[i]
                 cur_ratio = self.mask_ratio[i]
 
-                # --- Step 1: Classify VAE images by explicit vae_type labels ---
-                # Each entry: (vae_index, h, w, token_offset)
-                ref_noise_vae_list = []    # vae_type == "ref_noise"
-                nonref_noise_vae_list = []        # vae_type == "nonref_noise"
-                token_offset = 0
-                for vae_idx, (h, w) in enumerate(patchified_vae_latent_shapes):
-                    num_tokens = h * w
-                    # All tokens of one VAE image share the same vae_type
-                    vae_type = packed_vae_types[token_offset]
-                    entry = (vae_idx, h, w, token_offset)
-                    if vae_type == "ref_noise":
-                        ref_noise_vae_list.append(entry)
-                    elif vae_type == "nonref_noise":
-                        nonref_noise_vae_list.append(entry)
-                    else:
-                        raise ValueError(f"Unknown vae_type: {vae_type!r}. "
-                                        f"Expected 'ref', 'ref_noise', 'nonref_clean', or 'nonref_noise'.") 
-                    token_offset += num_tokens
-
-                num_nonref = len(nonref_noise_vae_list)
-                num_ref = len(ref_noise_vae_list)
-
-                # --- Step 2: Generate masks for each nonref image ---
-                # masks_2d[i]: (h, w) binary mask for nonref image i, 1=masked
-                masks_2d = []
-                for i in range(num_nonref):
-                    _, h, w, _ = nonref_noise_vae_list[i]
-                    mask = generate_connected_masks(
-                        B=1, V=1, H=h, W=w,
-                        ratio=cur_ratio,
-                        device=packed_latent_clean.device,
-                        dtype=torch.uint8,
-                        mode=cur_mode,
-                    )  # (1, 1, h, w)
-                    masks_2d.append(mask.squeeze(0).squeeze(0))  # (h, w)
-
-                # --- Step 4: Build mask flags for noise VAE tokens (masked positions only) ---
-                # This marks which tokens *within* the noise VAE correspond to masked patches.
-                # Used later to filter loss computation to masked positions only.
-                packed_noise_vae_mask_flags = torch.zeros(
-                    packed_latent_clean.shape[0], dtype=torch.bool,
-                    device=packed_latent_clean.device
-                )
-                for i in range(num_nonref):
-                    _, h, w, offset = nonref_noise_vae_list[i]
-                    num_tokens = h * w
-                    mask_flat = masks_2d[i].flatten().bool()
-                    packed_noise_vae_mask_flags[offset:offset + num_tokens] = mask_flat
-
-                # --- Step 5: Flow-matching 加噪 ---
+                # --- Step 1: 标准 Flow-matching 加噪（所有 VAE token）---
                 noise = torch.randn_like(packed_latent_clean)
 
                 packed_timesteps = torch.sigmoid(packed_timesteps)
@@ -546,19 +503,33 @@ class Bagel(PreTrainedModel):
                 latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
                 packed_latent = self.vae2llm(packed_latent_noised) + packed_timestep_embeds + latent_token_pos_emb
 
-                # --- Step 6: 在 LLM embedding 空间替换 nonref masked 位置为 learnable placeholder ---
-                # vae_mask_placeholder 维度是 hidden_size (3584)，必须在 vae2llm 之后替换。
-                # 这样 masked 位置在 LLM 输入中看到的是 placeholder（而非加噪 latent），
-                # 模型通过 attention 从 ref 和 nonref unmasked 区域获取信息来重建。
-                # 注意：packed_latent_noised 保持完整（包含 masked 位置的真实加噪值），
-                # 用于后续 loss 计算中反推 x_0_pred。
-                packed_latent[packed_noise_vae_mask_flags] = self.vae_mask_placeholder
-
+                # 所有 VAE token 直接放入 packed_sequence（不做 masking）
                 packed_sequence[packed_vae_token_indexes] = packed_latent
 
-                # NOTE: Nonref images have NO VIT tokens — this is enforced at the data side
-                # (need_vit=False for nonref images in MaskedReconIterableDataset).
-                # Only ref images have VIT, preventing information leakage of masked regions.
+                # --- Step 2: 对 nonref 的 VIT token 做 masking ---
+                # 直接使用 packed_vit_types 判断每个 VIT image 是否为 nonref。
+                if packed_vit_token_indexes is not None and vit_token_seqlens is not None and packed_vit_types is not None:
+                    vit_token_offset = 0
+                    for vit_img_idx, vit_seqlen in enumerate(vit_token_seqlens):
+                        # 通过 packed_vit_types 直接判断当前 VIT 是否为 nonref
+                        vit_type = packed_vit_types[vit_token_offset]
+                        if vit_type == "nonref_vit":
+                            # 直接从数据侧获取 VIT 空间的 (h, w)
+                            vit_h, vit_w = patchified_vit_latent_shapes[vit_img_idx]
+                            # 直接在 VIT 分辨率上生成 mask
+                            mask = generate_connected_masks(
+                                B=1, V=1, H=vit_h, W=vit_w,
+                                ratio=cur_ratio,
+                                device=packed_sequence.device,
+                                dtype=torch.uint8,
+                                mode=cur_mode,
+                            )  # (1, 1, vit_h, vit_w)
+                            mask_flat = mask.flatten().bool()[:vit_seqlen]
+                            # 获取这些 VIT token 在 packed_sequence 中的索引
+                            vit_global_indexes = packed_vit_token_indexes[vit_token_offset:vit_token_offset + vit_seqlen]
+                            masked_vit_indexes = vit_global_indexes[mask_flat]
+                            packed_sequence[masked_vit_indexes] = self.vit_mask_placeholder
+                        vit_token_offset += vit_seqlen
             else:
                 # === Original Flow-Matching Mode ===
                 noise = torch.randn_like(packed_latent_clean)
@@ -616,44 +587,15 @@ class Bagel(PreTrainedModel):
 
                 mse = (masked_preds - velocity_target) ** 2
             elif self.use_mae_masking and packed_vae_types is not None:
-                # === MAE-style Masked Reconstruction Loss ===
-                # 从 velocity prediction 反推 x_0_pred，然后只在 nonref masked 区域计算 reconstruction loss。
-                #
-                # 数学推导（flow-matching）：
-                #   x_t = (1 - t) * x_0 + t * ε        (x_0=clean, ε=noise)
-                #   v_t = ε - x_0                       (velocity target)
-                #   => x_0 = x_t - t * v_t
-                #
-                # 因此：x_0_pred = x_t - t * v_t_pred
-                #
-                # 索引空间说明：
-                #   mse_loss_indexes       — packed_sequence 空间（text + vit + vae）
-                #   packed_latent 空间     — 仅 vae token
-                # 当前数据侧所有 VAE entry 都是 loss=1（need_vae=False），
-                # 因此 mse_loss_indexes 选出的 token 数 == packed_latent_clean.shape[0]，
-                # 两者一一对应。x_t / timestep 直接从 packed_latent 空间取即可。
-                #
-                # Loss 策略（方案 B）：
-                #   - ref 图片：被加噪参与 forward，但不算 loss
-                #   - nonref 图片：只在 masked 区域算 reconstruction loss
-                #   packed_noise_vae_mask_flags 已经只标记了 nonref 的 masked 位置
-
-                # Step 1: 获取所有 VAE token 的 velocity 预测（packed_sequence 空间）
-                all_v_t_pred = self.llm2vae(last_hidden_state[mse_loss_indexes])
-
-                # Step 2: 获取对应的 x_t 和 timestep（packed_latent 空间，与 all_v_t_pred 一一对应）
-                x_t_all = packed_latent_noised   # 全部 VAE token 的加噪结果
-                t_all = packed_timesteps          # 全部 VAE token 的 timestep
-
-                # Step 3: 反推 x_0_pred = x_t - t * v_t_pred
-                x_0_pred = x_t_all - t_all[:, None] * all_v_t_pred
-
-                # Step 4: 只在 nonref masked 区域计算 reconstruction loss
-                # packed_noise_vae_mask_flags 在 packed_latent 空间中标记 nonref 的 masked 位置
-                x_0_pred_masked = x_0_pred[packed_noise_vae_mask_flags]
-                x_0_clean_masked = packed_latent_clean[packed_noise_vae_mask_flags]
-
-                mse = (x_0_pred_masked - x_0_clean_masked) ** 2
+                # === MAE-style: 标准 Velocity Loss（所有 VAE token）===
+                # 所有 VAE token（ref + nonref）都参与标准 flow-matching velocity loss，
+                # 和普通 t2i 完全一样。MAE 的效果完全通过 VIT masking 来实现：
+                # nonref 的 VIT condition 被 mask 了，模型需要从不完整的 condition
+                # 中学会去噪/重建。
+                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
+                target = noise - packed_latent_clean  # v_t = ε - x_0
+                has_mse = packed_timesteps > 0
+                mse = (packed_mse_preds - target[has_mse]) ** 2
             else:
                 # === Original Flow-Matching Loss ===
                 packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])

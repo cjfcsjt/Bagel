@@ -197,7 +197,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
             vit_token_seqlens           = list(),
             packed_vit_position_ids     = list(),
             packed_vit_token_indexes    = list(), 
+            vit_latent_shapes           = list(),
             packed_vae_types            = list(),
+            packed_vit_types            = list(),
         )
         return sequence_status
 
@@ -238,6 +240,11 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['packed_vit_position_ids'] = torch.cat(sequence_status['packed_vit_position_ids'], dim=0)
             data['packed_vit_token_indexes'] = torch.tensor(sequence_status['packed_vit_token_indexes'])
             data['vit_token_seqlens'] = torch.tensor(sequence_status['vit_token_seqlens'])
+            data['patchified_vit_latent_shapes'] = sequence_status['vit_latent_shapes']
+
+        # Propagate per-VIT-token type labels (ref / nonref / None)
+        if len(sequence_status['packed_vit_types']) > 0:
+            data['packed_vit_types'] = sequence_status['packed_vit_types']
 
         # if the model is required to perform visual generation
         if len(sequence_status['packed_timesteps']) > 0:
@@ -440,6 +447,11 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
                 sequence_status['packed_vit_tokens'].append(vit_tokens)
                 sequence_status['vit_token_seqlens'].append(num_img_tokens)
+                vit_type = item.get('vit_type', None)
+                sequence_status['packed_vit_types'].extend([vit_type] * num_img_tokens)
+                h_vit = image_tensor.size(1) // self.data_config.vit_patch_size
+                w_vit = image_tensor.size(2) // self.data_config.vit_patch_size
+                sequence_status['vit_latent_shapes'].append((h_vit, w_vit))
                 sequence_status['packed_vit_position_ids'].append(
                     self.get_flattened_position_ids(
                         image_tensor.size(1), image_tensor.size(2),
@@ -576,6 +588,7 @@ class SimpleCustomBatch:
             self.packed_vit_position_ids = data["packed_vit_position_ids"]
             self.packed_vit_token_indexes = data["packed_vit_token_indexes"]
             self.vit_token_seqlens = data["vit_token_seqlens"]
+            self.patchified_vit_latent_shapes = data.get("patchified_vit_latent_shapes", None)
 
         if "packed_timesteps" in data.keys():
             self.packed_timesteps = data["packed_timesteps"]
@@ -583,6 +596,9 @@ class SimpleCustomBatch:
 
         if "packed_vae_types" in data.keys():
             self.packed_vae_types = data["packed_vae_types"]
+
+        if "packed_vit_types" in data.keys():
+            self.packed_vit_types = data["packed_vit_types"]
 
         if "packed_label_ids" in data.keys():
             self.packed_label_ids = data["packed_label_ids"]
@@ -676,6 +692,8 @@ class SimpleCustomBatch:
             data['packed_vit_position_ids'] = self.packed_vit_position_ids
             data['packed_vit_token_indexes'] = self.packed_vit_token_indexes
             data['vit_token_seqlens'] = self.vit_token_seqlens
+            if self.patchified_vit_latent_shapes is not None:
+                data['patchified_vit_latent_shapes'] = self.patchified_vit_latent_shapes
 
         if hasattr(self, 'packed_timesteps'):
             data['packed_timesteps'] = self.packed_timesteps
@@ -683,6 +701,9 @@ class SimpleCustomBatch:
 
         if hasattr(self, 'packed_vae_types'):
             data['packed_vae_types'] = self.packed_vae_types
+
+        if hasattr(self, 'packed_vit_types'):
+            data['packed_vit_types'] = self.packed_vit_types
 
         if hasattr(self, 'packed_label_ids'):
             data['packed_label_ids'] = self.packed_label_ids
