@@ -487,6 +487,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
         sample_lens = 0
         vit_cnt = 0
         vae_cnt = 0
+        # partial noise 模式下，同一 video split 内共享的 mask 参数
+        cur_mask_mode = None
+        cur_mask_ratio = None
 
         for item in sequence_plan:
             split_start = item.get('split_start', True)
@@ -618,7 +621,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
                         sequence_status['packed_timesteps'].extend([float('-inf')] * num_img_tokens)
                     elif vae_type == 'nonref':
                         # nonref 图片：生成空间 mask，被 mask 的 token 加噪
-                        if split_start:
+                        # 在 split_start 或首次遇到 nonref 帧时初始化 timestep/mask 参数
+                        # （split 的第一帧可能是 ref，导致 split_start 时未进入此分支）
+                        if split_start or cur_mask_mode is None:
                             # 整个 video split 共享一个 timestep
                             timestep = np.random.randn()
                             # 随机选择 mask 模式和比例
