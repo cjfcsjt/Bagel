@@ -503,7 +503,7 @@ def apply_template_qwenvl2(question_with_image_tokens,answer):
     if len(answer)>0:
         chat_template4= '\n'+answer
     ret = []
-    pattern = r'(<vit_image>|<dino_image>)'
+    pattern = r'(<vit_image>|<dino_image>|<vae_image>)'
     chat_template2_split = re.split(pattern, chat_template2)
     chat_template2_split = [p for p in chat_template2_split if len(p)>0]
     ret.append({
@@ -513,7 +513,7 @@ def apply_template_qwenvl2(question_with_image_tokens,answer):
     })
     
     for split_ in chat_template2_split:
-        if split_ not in ['<vit_image>','<dino_image>']:
+        if split_ not in ['<vit_image>','<dino_image>','<vae_image>']:
             ret.append({
                 'type':'text',
                 'loss':False,
@@ -528,6 +528,12 @@ def apply_template_qwenvl2(question_with_image_tokens,answer):
         elif split_=='<dino_image>':
             ret.append({
                 'type':'dino',
+                'loss':False,
+                'value':split_,
+            })
+        elif split_=='<vae_image>':
+            ret.append({
+                'type':'vae',
                 'loss':False,
                 'value':split_,
             })

@@ -33,7 +33,7 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
         )
         return data
 
-    def _add_image(self, data, image, need_loss, need_vae, need_vit, enable_cfg=True, vae_type=None):
+    def _add_image(self, data, image, need_loss, need_vae, need_vit, enable_cfg=True, vae_type=None, vit_type=None):
         assert need_loss or need_vae or need_vit
 
         if need_loss:
@@ -78,6 +78,7 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
                     'loss': 0,
                     'special_token_loss': 0,
                     'special_token_label': None,
+                    'vit_type': vit_type,
                 },
             )
             vit_image_tensor = self.vit_transform(image)
@@ -87,7 +88,7 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
 
         return data
 
-    def _add_video(self, data, frames, frame_indexes, need_loss, need_vae, enable_cfg=True):
+    def _add_video(self, data, frames, frame_indexes, need_loss, need_vae, enable_cfg=True, vae_type=None):
         assert int(need_loss) + int(need_vae) == 1
 
         if need_loss:
@@ -98,6 +99,7 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
                     'loss': 1, 
                     'special_token_loss': 0,
                     'special_token_label': None,
+                    'vae_type': vae_type,
                     'split_start': idx == 0,
                     'split_end': idx == len(frames) - 1,
                 }
@@ -117,6 +119,7 @@ class InterleavedBaseIterableDataset(DistributedIterableDataset):
                     'loss': 0, 
                     'special_token_loss': 0,
                     'special_token_label': None,
+                    'vae_type': vae_type,
                     'split_start': idx == 0,
                     'split_end': idx == len(frames) - 1,
                 }

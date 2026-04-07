@@ -265,6 +265,9 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         shuffle_seed=0,
         task_grouped_shuffle=True,
         batch_size=4,
+        # ── VAE 多视角一致性训练参数 ──
+        vit_transform=None,
+        ref_num=2,
         # ── VideoProcessor 扁平参数（直接从 YAML 传入） ──
         video_folder='data',
         annotation_dir='data/embodiedscan/',
@@ -281,7 +284,9 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         add_spatial_instruction=False,
     ):
         super().__init__(dataset_name, local_rank, world_size, num_workers)
-        self.transform = transform
+        self.transform = transform  # VAE transform (stride=16) 或原始 VIT transform
+        self.vit_transform = vit_transform  # VIT transform (stride=14)，若提供则启用 VAE 一致性
+        self.ref_num = ref_num
         self.tokenizer = tokenizer
         self.frame_sampler = frame_sampler
         self.data_status = data_status
@@ -450,7 +455,22 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
             row_start_id = self.data_status[worker_id] + 1
         else:
             row_start_id = 0
-        transform_stride = self.transform.stride
+
+        # 确定 VIT 和 VAE 的 transform 和 stride
+        # 当 vit_transform 存在时：transform = VAE (stride=16), vit_transform = VIT (stride=14)
+        # 当 vit_transform 不存在时：transform = VIT (stride=14)，不启用 VAE 一致性
+        if self.vit_transform is not None:
+            vae_transform = self.transform
+            vit_transform = self.vit_transform
+            vae_stride = vae_transform.stride
+            vit_stride = vit_transform.stride
+            enable_vae_consistency = True
+        else:
+            vit_transform = self.transform
+            vit_stride = vit_transform.stride
+            vae_transform = None
+            vae_stride = None
+            enable_vae_consistency = False
 
         print(
             f"rank-{self.local_rank} worker-{worker_id} dataset-{self.dataset_name}: "
@@ -576,25 +596,35 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                                     item['value'] = special_tokens + " " + item['value']
                                 break
 
+                        # ── VAE 多视角一致性：在 question 前拼接 VAE token ──
+                        if enable_vae_consistency and len(raw_images) >= 2:
+                            vae_prefix = 'Reconstruct the scene' + '<vae_image>' * len(raw_images)
+                            for item in data_item['conversations']:
+                                if item['from'] == 'human':
+                                    item['value'] = vae_prefix + item['value']
+                                    break
+
                 except Exception:
                     traceback.print_exc()
                     continue
 
-                # ── VIT 图像编码 ──
-                # 使用 ImageTransform (VAE版) 接口：输入单个 PIL.Image, 返回 tensor (C, H, W)
-                if raw_images:
-                    for raw_image in raw_images:
-                        image_tensor = self.transform(raw_image, img_num=len(raw_images)) 
-                        image_tensor_list.append(image_tensor)
-                        height, width = image_tensor.shape[1:]
-                        num_tokens += width * height // transform_stride ** 2
-
                 # ── 文本模板处理 ──
+                # 注意：不再提前处理 VIT 图片，而是在 split_list 遍历中按顺序处理
+                # 这样 image_tensor_list 的顺序与 sequence_plan 中 vae_image/vit_image 的出现顺序一致
                 question = data_item['conversations'][0]["value"]
                 answer = data_item['conversations'][1]["value"]
                 split_list = apply_template_qwenvl2(
                     question_with_image_tokens=question, answer=answer
                 )
+
+                # VAE 一致性相关状态
+                vae_counter = 0  # 追踪当前是第几张 VAE 图片
+                vit_counter = 0  # 追踪当前是第几张 VIT 图片
+                total_vae_count = 0
+                actual_ref_num = 0
+                if enable_vae_consistency and raw_images and len(raw_images) >= 2:
+                    total_vae_count = len(raw_images)
+                    actual_ref_num = min(self.ref_num, total_vae_count - 1)
 
                 for item in split_list:
                     if item['type'] == 'text':
@@ -611,7 +641,17 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                                 'special_token_label': None,
                             }
                             sequence_plan.append(current_plan)
+
                     elif item['type'] == 'vit':
+                        # VIT 图片：在遍历时处理 transform，保持与 sequence_plan 顺序一致
+                        if raw_images and vit_counter < len(raw_images):
+                            raw_image = raw_images[vit_counter]
+                            image_tensor = vit_transform(raw_image, img_num=len(raw_images))
+                            image_tensor_list.append(image_tensor)
+                            height, width = image_tensor.shape[1:]
+                            num_tokens += width * height // vit_stride ** 2
+                            vit_counter += 1
+
                         current_plan = {
                             'type': 'vit_image',
                             'enable_cfg': 0,
@@ -620,6 +660,40 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                             'special_token_label': None,
                         }
                         sequence_plan.append(current_plan)
+
+                    elif item['type'] == 'vae':
+                        # VAE 图片：使用 VAE transform 处理，区分 ref/nonref
+                        if raw_images and vae_counter < total_vae_count:
+                            raw_image = raw_images[vae_counter]
+                            image_tensor = vae_transform(raw_image, img_num=total_vae_count)
+                            image_tensor_list.append(image_tensor)
+                            height, width = image_tensor.shape[1:]
+                            num_tokens += width * height // vae_stride ** 2
+
+                            # 区分 ref / nonref
+                            if vae_counter < actual_ref_num:
+                                vae_type = 'ref'
+                                loss = 0
+                            else:
+                                vae_type = 'nonref'
+                                loss = 1
+
+                            # video 模式：split_start / split_end / frame_delta
+                            current_plan = {
+                                'type': 'vae_image',
+                                'enable_cfg': 0,
+                                'loss': loss,
+                                'special_token_loss': 0,
+                                'special_token_label': None,
+                                'vae_type': vae_type,
+                                'split_start': vae_counter == 0,
+                                'split_end': vae_counter == total_vae_count - 1,
+                            }
+                            if vae_counter < total_vae_count - 1:
+                                current_plan['frame_delta'] = 1  # 帧间距为 1
+
+                            sequence_plan.append(current_plan)
+                            vae_counter += 1
 
                 has_loss = [item['loss'] for item in sequence_plan]
                 if sum(has_loss) == 0:
@@ -713,6 +787,10 @@ def main():
                         help="从数据文件中使用的数据条数")
     parser.add_argument("--generative_feature_source", type=str, default="none",
                         help="生成特征来源: offline / none")
+    parser.add_argument("--enable_vae_consistency", action="store_true",
+                        help="启用 VAE 多视角一致性训练模式")
+    parser.add_argument("--ref_num", type=int, default=2,
+                        help="VAE 一致性模式中 ref 图片数量")
     args = parser.parse_args()
 
     print("=" * 60)
@@ -725,38 +803,26 @@ def main():
     print(f"  strategy:       {args.strategy}")
     print(f"  num_used_data:  {args.num_used_data}")
     print(f"  gen_feat_src:   {args.generative_feature_source}")
+    print(f"  vae_consist:    {args.enable_vae_consistency}")
+    print(f"  ref_num:        {args.ref_num}")
     print("=" * 60)
 
-    # ── Mock vit_transform ──
-    # 模拟 Bagel 的 vit_transform：输入 PIL 图片列表，输出 (image_tensor, image_grid_thw)
-    class MockVitTransform:
-        def __init__(self, image_size=384, patch_size=14):
+    # ── Mock transform ──
+    # 模拟 Bagel 的 ImageTransform：输入单个 PIL.Image, 返回 tensor (C, H, W)
+    class MockImageTransform:
+        def __init__(self, image_size=384, stride=14):
             self.image_size = image_size
-            self.patch_size = patch_size
-            self.stride = patch_size
+            self.stride = stride
         
-        def __call__(self, images, img_num=1):
-            """
-            模拟 vit_transform：
-              - 输入: images = [PIL.Image], img_num = int
-              - 输出: (image_tensor, image_grid_thw)
-                - image_tensor: (num_patches * 4, hidden_dim) 模拟
-                - image_grid_thw: [(t, h, w)]
-            """
-            img = images[0]
-            # resize 到 image_size
-            img = img.resize((self.image_size, self.image_size))
+        def __call__(self, img, img_num=1):
+            """模拟 ImageTransform：输入 PIL.Image, 返回 (C, H, W) tensor。"""
+            # resize 到 stride 的整数倍
+            target_size = (self.image_size // self.stride) * self.stride
+            img = img.resize((target_size, target_size))
             img_array = np.array(img).astype(np.float32) / 255.0
-            
-            h_patches = self.image_size // self.patch_size
-            w_patches = self.image_size // self.patch_size
-            num_patches = h_patches * w_patches
-            
-            # 模拟输出：(num_patches * 4, 3) —— 实际 Bagel 中是 (num_patches * 4, hidden_dim)
-            image_tensor = torch.randn(num_patches * 4, 3)
-            image_grid_thw = [torch.tensor([1, h_patches, w_patches])]
-            
-            return image_tensor, image_grid_thw
+            # (H, W, C) -> (C, H, W)
+            image_tensor = torch.from_numpy(img_array.transpose(2, 0, 1))
+            return image_tensor
 
     # ── Mock tokenizer ──
     class MockTokenizer:
@@ -782,14 +848,21 @@ def main():
             return []
 
     # ── 构建数据集 ──
-    vit_transform = MockVitTransform()
+    vit_transform = MockImageTransform(image_size=384, stride=14)
     tokenizer = MockTokenizer()
     frame_sampler = MockFrameSampler()
+
+    # VAE 一致性模式：使用两套 transform
+    vae_transform = None
+    if args.enable_vae_consistency:
+        vae_transform = MockImageTransform(image_size=384, stride=16)
 
     print("\n[1/3] 初始化 VideoLLM3DIterableDataset ...")
     dataset = VideoLLM3DIterableDataset(
         dataset_name="videollm3d_debug",
-        vit_transform=vit_transform,
+        transform=vae_transform if vae_transform else vit_transform,  # VAE 模式下 transform=VAE
+        vit_transform=vit_transform if vae_transform else None,  # VAE 模式下 vit_transform=VIT
+        ref_num=args.ref_num,
         tokenizer=tokenizer,
         frame_sampler=frame_sampler,
         jsonl_path_list=[args.jsonl_path],
@@ -829,14 +902,33 @@ def main():
         print(f"  num_tokens:          {sample['num_tokens']}")
         print(f"  image_tensor_list:   {len(sample['image_tensor_list'])} 张图片")
         if sample['image_tensor_list']:
-            print(f"    第一张 shape:      {sample['image_tensor_list'][0].shape}")
+            for i, t in enumerate(sample['image_tensor_list']):
+                print(f"    图片 {i} shape:     {t.shape}")
         print(f"  text_ids_list:       {len(sample['text_ids_list'])} 段文本")
         for i, ids in enumerate(sample['text_ids_list']):
             print(f"    段 {i}: {len(ids)} tokens")
-        print(f"  image_grid_thw_list: {len(sample['image_grid_thw_list'])} 个 grid")
         print(f"  sequence_plan:       {len(sample['sequence_plan'])} 步")
+        vae_count = 0
+        vit_count = 0
         for i, plan in enumerate(sample['sequence_plan']):
-            print(f"    步 {i}: type={plan['type']}, loss={plan['loss']}")
+            extra = ""
+            if plan['type'] == 'vae_image':
+                extra = f", vae_type={plan.get('vae_type')}, split_start={plan.get('split_start')}, split_end={plan.get('split_end')}"
+                if 'frame_delta' in plan:
+                    extra += f", frame_delta={plan['frame_delta']}"
+                vae_count += 1
+            elif plan['type'] == 'vit_image':
+                vit_count += 1
+            print(f"    步 {i}: type={plan['type']}, loss={plan['loss']}{extra}")
+        
+        if vae_count > 0:
+            print(f"  VAE 图片数:          {vae_count} (ref={args.ref_num}, nonref={vae_count - min(args.ref_num, vae_count - 1)})")
+        print(f"  VIT 图片数:          {vit_count}")
+        print(f"  image_tensor_list 总数: {len(sample['image_tensor_list'])} (应等于 VAE+VIT={vae_count + vit_count})")
+        
+        # 验证 image_tensor_list 长度
+        assert len(sample['image_tensor_list']) == vae_count + vit_count, \
+            f"image_tensor_list 长度 {len(sample['image_tensor_list'])} != VAE({vae_count}) + VIT({vit_count})"
         
         if 'video_dict' in sample:
             vd = sample['video_dict']
@@ -864,6 +956,8 @@ def main():
 
     print(f"\n{'═' * 60}")
     print(f"[3/3] 完成！成功遍历 {count} 个样本。")
+    if args.enable_vae_consistency:
+        print(f"  ✅ VAE 一致性模式已启用 (ref_num={args.ref_num})")
     if count == 0:
         print("  ⚠️  没有成功产出任何样本，请检查：")
         print("     1. 数据文件路径是否正确")

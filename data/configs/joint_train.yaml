@@ -145,11 +145,15 @@ videollm3d:
   # - scan2cap
   # - scanrefer
   # - multi3drefer
-  image_transform_args:
+  image_transform_args:       # → transform (VAE, stride=16)
+    image_stride: 16
+    max_image_size: 256
+    min_image_size: 256
+  vit_image_transform_args:   # → vit_transform (VIT, stride=14)
     image_stride: 14
-    max_image_size: 378
-    min_image_size: 378
-    max_pixels: 2_007_040
+    max_image_size: 384
+    min_image_size: 256
+  ref_num: 2
   frame_sampler_args:
     max_num_frames: 12
     min_num_frames: 8

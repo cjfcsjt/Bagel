@@ -349,6 +349,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable masked autoencoder (MAE) style masking for conditional generation."}
     )
+    use_partial_noise: bool = field(
+        default=False,
+        metadata={"help": "Enable partial noise mode for conditional generation."}
+    )
     mask_mode: str = field(
         default=None,
         metadata={"help": "List of mask generation strategies, e.g. ['random', 'rectangle', 'blob']. "
@@ -537,6 +541,7 @@ def main():
         timestep_shift=training_args.timestep_shift,
         use_masking=training_args.use_masking,
         use_mae_masking=training_args.use_mae_masking,
+        use_partial_noise=training_args.use_partial_noise,
         mask_mode=training_args.mask_mode.split(',') if training_args.mask_mode else None,
         mask_ratio=[float(r) for r in training_args.mask_ratio.split(',')] if training_args.mask_ratio else None,
     )
@@ -731,7 +736,7 @@ def main():
             loss_dict["ce"] = ce.detach()
             loss = loss + ce * training_args.ce_weight
         else:
-            assert not training_args.visual_und
+            # assert not training_args.visual_und
             loss_dict["ce"] = torch.tensor(0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 

@@ -151,6 +151,7 @@ class BagelConfig(PretrainedConfig):
         timestep_shift=1.0,
         use_masking=False,
         use_mae_masking=False,
+        use_partial_noise=False,
         mask_mode=None,
         mask_ratio=None,
         **kwargs
@@ -169,6 +170,7 @@ class BagelConfig(PretrainedConfig):
         self.timestep_shift = timestep_shift
         self.use_masking = use_masking
         self.use_mae_masking = use_mae_masking
+        self.use_partial_noise = use_partial_noise
         self.mask_mode = mask_mode if mask_mode is not None else ['random']
         self.mask_ratio = mask_ratio if mask_ratio is not None else [0.75]
 
@@ -199,6 +201,7 @@ class Bagel(PreTrainedModel):
             # Masked reconstruction support
             self.use_masking = config.use_masking
             self.use_mae_masking = config.use_mae_masking
+            self.use_partial_noise = config.use_partial_noise
             self.mask_mode = config.mask_mode
             self.mask_ratio = config.mask_ratio
             if self.use_masking:
@@ -304,7 +307,7 @@ class Bagel(PreTrainedModel):
         else:
             attention_mask = nested_attention_masks
 
-        if self.config.visual_und:
+        if self.config.visual_und and vit_token_seqlens is not None:
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
@@ -530,6 +533,26 @@ class Bagel(PreTrainedModel):
                             masked_vit_indexes = vit_global_indexes[mask_flat]
                             packed_sequence[masked_vit_indexes] = self.vit_mask_placeholder
                         vit_token_offset += vit_seqlen
+            elif self.use_partial_noise and packed_vae_types is not None:
+                # === Partial Noise Mode ===
+                #
+                # 所有 VAE token 在一个 video split 中（full 双向注意力）。
+                # packed_timesteps 已在数据侧设置：
+                #   - ref token 和 nonref 未 mask token: timestep = -inf → sigmoid 后 ≈ 0（clean）
+                #   - nonref 被 mask 的 token: timestep = 正常采样值 → sigmoid 后 > 0（加噪）
+                #
+                # 统一执行 flow-matching 公式：x_t = (1 - t) * clean + t * noise
+                # clean token 的 t ≈ 0，自然保持 x_t ≈ clean
+                # target token 的 t > 0，正常加噪
+
+                noise = torch.randn_like(packed_latent_clean)
+                packed_timesteps = torch.sigmoid(packed_timesteps)
+                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
+                packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
+                packed_timestep_embeds = self.time_embedder(packed_timesteps)
+                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
+                packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
+                packed_sequence[packed_vae_token_indexes] = packed_latent
             else:
                 # === Original Flow-Matching Mode ===
                 noise = torch.randn_like(packed_latent_clean)
@@ -592,6 +615,14 @@ class Bagel(PreTrainedModel):
                 # 和普通 t2i 完全一样。MAE 的效果完全通过 VIT masking 来实现：
                 # nonref 的 VIT condition 被 mask 了，模型需要从不完整的 condition
                 # 中学会去噪/重建。
+                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
+                target = noise - packed_latent_clean  # v_t = ε - x_0
+                has_mse = packed_timesteps > 0
+                mse = (packed_mse_preds - target[has_mse]) ** 2
+            elif self.use_partial_noise and packed_vae_types is not None:
+                # === Partial Noise Loss ===
+                # mse_loss_indexes 仅包含被 mask 的 nonref token 位置（在数据侧已设置）。
+                # 只在这些位置计算 velocity target v = noise - clean。
                 packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
                 target = noise - packed_latent_clean  # v_t = ε - x_0
                 has_mse = packed_timesteps > 0

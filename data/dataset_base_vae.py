@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import math
 import random
 import json
 
@@ -20,6 +21,98 @@ from .transforms import ImageTransform
 from .video_utils import FrameSampler
 
 
+def generate_mask_numpy(H, W, ratio, mode='rectangle', ar_range=(0.3, 3.0)):
+    """
+    在数据侧生成空间 mask（numpy 版本，无需 GPU）。
+    返回 (H, W) 的 numpy 数组，1=masked, 0=visible。
+    """
+    mask = np.zeros((H, W), dtype=np.uint8)
+    if ratio <= 0:
+        return mask
+    if ratio >= 1:
+        return np.ones((H, W), dtype=np.uint8)
+
+    total = H * W
+
+    if mode == 'rectangle':
+        target_area = max(1, int(round(ratio * total)))
+        log_min, log_max = math.log(ar_range[0]), math.log(ar_range[1])
+        ar = math.exp(random.uniform(log_min, log_max))
+        h = max(1, int(round(math.sqrt(target_area / ar))))
+        w = max(1, int(round(ar * h)))
+        h = max(1, min(h, H))
+        w = max(1, min(w, W))
+        top = 0 if H == h else random.randint(0, H - h)
+        left = 0 if W == w else random.randint(0, W - w)
+        mask[top:top+h, left:left+w] = 1
+
+    elif mode == 'random':
+        target = max(1, int(round(ratio * total)))
+        noise = np.random.randn(H, W)
+        flat = noise.flatten()
+        threshold = np.partition(flat, -target)[-target]
+        mask = (noise >= threshold).astype(np.uint8)
+
+    elif mode == 'ellipse':
+        target_area = max(1, int(round(ratio * total)))
+        base_r = math.sqrt(target_area / math.pi)
+        log_min, log_max = math.log(ar_range[0]), math.log(ar_range[1])
+        ar = math.exp(random.uniform(log_min, log_max))
+        ry = max(1, int(round(base_r / math.sqrt(ar))))
+        rx = max(1, int(round(base_r * math.sqrt(ar))))
+        ry, rx = min(ry, H // 2), min(rx, W // 2)
+        cy = random.randint(ry, max(ry, H - ry - 1)) if H - 2 * ry > 0 else H // 2
+        cx = random.randint(rx, max(rx, W - rx - 1)) if W - 2 * rx > 0 else W // 2
+        yy, xx = np.mgrid[:H, :W]
+        ellipse = ((yy - cy) ** 2 / (ry ** 2 + 1e-6) + (xx - cx) ** 2 / (rx ** 2 + 1e-6)) <= 1
+        mask = ellipse.astype(np.uint8)
+
+    elif mode == 'blob':
+        smooth_k = 10
+        target = max(1, int(round(ratio * total)))
+        noise = np.random.randn(H, W)
+        # 简单的均值滤波平滑
+        kernel_size = min(smooth_k, H, W)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        pad = kernel_size // 2
+        padded = np.pad(noise, pad, mode='reflect')
+        from scipy.ndimage import uniform_filter
+        smoothed = uniform_filter(noise, size=kernel_size)
+        flat = smoothed.flatten()
+        threshold = np.partition(flat, -target)[-target]
+        mask = (smoothed >= threshold).astype(np.uint8)
+
+    elif mode == 'random_walk':
+        from collections import deque
+        target = max(1, int(round(ratio * H * W)))
+        visited = np.zeros((H, W), dtype=bool)
+        y = random.randint(0, H - 1)
+        x = random.randint(0, W - 1)
+        q = deque()
+        q.append((y, x))
+        visited[y, x] = True
+        filled = 0
+        while q and filled < target:
+            cy, cx = q.popleft()
+            mask[cy, cx] = 1
+            filled += 1
+            if filled >= target:
+                break
+            dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+            random.shuffle(dirs)
+            for dy, dx in dirs:
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    q.append((ny, nx))
+
+    else:
+        raise ValueError(f"Unknown mask mode: {mode}")
+
+    return mask
+
+
 class DataConfig:
     def __init__(
         self, 
@@ -31,6 +124,10 @@ class DataConfig:
         max_latent_size=32,
         vit_patch_size=14,
         max_num_patch_per_side=70,
+        # partial noise 模式的 mask 配置
+        use_partial_noise=False,
+        partial_noise_mask_mode=None,
+        partial_noise_mask_ratio=None,
     ):
         self.grouped_datasets = grouped_datasets
         self.text_cond_dropout_prob = text_cond_dropout_prob
@@ -40,6 +137,10 @@ class DataConfig:
         self.vae_cond_dropout_prob = vae_cond_dropout_prob
         self.vae_image_downsample = vae_image_downsample
         self.max_latent_size = max_latent_size
+        # partial noise 模式的 mask 配置
+        self.use_partial_noise = use_partial_noise
+        self.partial_noise_mask_mode = partial_noise_mask_mode if partial_noise_mask_mode is not None else ['random']
+        self.partial_noise_mask_ratio = partial_noise_mask_ratio if partial_noise_mask_ratio is not None else [0.75]
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -505,15 +606,53 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
                 num_img_tokens = w * h
                 sequence_status['packed_vae_token_indexes'].extend(range(curr, curr + num_img_tokens))
-                if item['loss'] == 1:
-                    sequence_status['mse_loss_indexes'].extend(range(curr, curr + num_img_tokens))
-                    if split_start:
-                        timestep = np.random.randn()
-                else:
-                    timestep = float('-inf')
 
-                sequence_status['packed_timesteps'].extend([timestep] * num_img_tokens)
                 vae_type = item.get('vae_type', None)
+
+                if self.data_config.use_partial_noise and vae_type in ('ref', 'nonref'):
+                    # === Partial Noise 模式 ===
+                    # ref: 所有 token 保持 clean（timestep=-inf），不参与 loss
+                    # nonref: 被 mask 的 token 加噪（正常 timestep），未被 mask 的保持 clean
+                    if vae_type == 'ref':
+                        # ref 图片：完全 clean，不参与 loss
+                        sequence_status['packed_timesteps'].extend([float('-inf')] * num_img_tokens)
+                    elif vae_type == 'nonref':
+                        # nonref 图片：生成空间 mask，被 mask 的 token 加噪
+                        if split_start:
+                            # 整个 video split 共享一个 timestep
+                            timestep = np.random.randn()
+                            # 随机选择 mask 模式和比例
+                            mask_idx = random.randint(0, len(self.data_config.partial_noise_mask_mode) - 1)
+                            cur_mask_mode = self.data_config.partial_noise_mask_mode[mask_idx]
+                            cur_mask_ratio = self.data_config.partial_noise_mask_ratio[mask_idx]
+
+                        # 生成空间 mask: (h, w), 1=masked, 0=visible
+                        spatial_mask = generate_mask_numpy(h, w, cur_mask_ratio, mode=cur_mask_mode)
+                        mask_flat = spatial_mask.flatten()  # (h*w,)
+
+                        # 为每个 token 设置 timestep
+                        token_timesteps = []
+                        token_range = list(range(curr, curr + num_img_tokens))
+                        for tok_idx, is_masked in zip(token_range, mask_flat):
+                            if is_masked:
+                                token_timesteps.append(timestep)
+                                sequence_status['mse_loss_indexes'].append(tok_idx)
+                            else:
+                                token_timesteps.append(float('-inf'))
+                        sequence_status['packed_timesteps'].extend(token_timesteps)
+                else:
+                    # === 原有逻辑（非 partial noise 模式）===
+                    if item['loss'] == 1:
+                        sequence_status['mse_loss_indexes'].extend(range(curr, curr + num_img_tokens))
+                        if split_start or timestep == float('-inf'):
+                            # split_start: 新 split 的第一帧，采样新 timestep
+                            # timestep == -inf: 前面的帧是 ref（loss=0），timestep 被设为 -inf，
+                            #   当前帧是 nonref（loss=1），需要重新采样有效 timestep
+                            timestep = np.random.randn()
+                    else:
+                        timestep = float('-inf')
+                    sequence_status['packed_timesteps'].extend([timestep] * num_img_tokens)
+
                 sequence_status['packed_vae_types'].extend([vae_type] * num_img_tokens)
                 curr += num_img_tokens
                 curr_split_len += num_img_tokens
