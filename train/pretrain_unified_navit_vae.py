@@ -651,6 +651,12 @@ def main():
         dataset_config.text_cond_dropout_prob = model_args.text_cond_dropout_prob
         dataset_config.vae_cond_dropout_prob = model_args.vae_cond_dropout_prob
         dataset_config.vit_cond_dropout_prob = model_args.vit_cond_dropout_prob
+    # partial noise 配置注入
+    dataset_config.use_partial_noise = training_args.use_partial_noise
+    if training_args.mask_mode:
+        dataset_config.partial_noise_mask_mode = training_args.mask_mode.split(',')
+    if training_args.mask_ratio:
+        dataset_config.partial_noise_mask_ratio = [float(r) for r in training_args.mask_ratio.split(',')]
     train_dataset = PackedDataset(
         dataset_config,
         tokenizer=tokenizer,
