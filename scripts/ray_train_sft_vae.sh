@@ -82,7 +82,7 @@ export RAY_ADDRESS="172.16.4.24:6380"  # TODO: 替换为你的 Head 节点 IP
   --behind_vae True \
   --mask_mode "random,rectangle,ellipse" \
   --mask_ratio "0.9,0.75,0.75" \
-  --max_num_tokens 52000 \
+  --max_num_tokens 52096 \
   --expected_num_tokens 50000 \
   --max_num_tokens_per_sample 50000 \
   --num_shard 16 \
