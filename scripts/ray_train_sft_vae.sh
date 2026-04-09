@@ -37,7 +37,7 @@ export WANDB_PROJECT="bagel-sft-training-sh"     # 你可以选择一个项目�
 # export NCCL_IB_HCA="mlx5_0"
 # export NCCL_P2P_LEVEL="NVL"
 
-RUNID=158
+RUNID=159
 
 # =====================================================================
 # 前置步骤：在每个节点的 conda 环境中启动独立的 Ray 集群
