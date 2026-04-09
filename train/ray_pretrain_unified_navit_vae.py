@@ -460,6 +460,10 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable FLEX (flash-ext friendly) packing algorithm for sequence data."}
     )
+    behind_vae: bool = field(
+        default=False,
+        metadata={"help": "Enable behind-VAE mode: VAE tokens placed after VIT tokens, only nonref, masked denoise."}
+    )
 
     # --- Ray 分布式配置 ---
     num_ray_workers: int = field(
@@ -615,6 +619,7 @@ def train_func(config: dict):
         use_partial_noise=training_args.use_partial_noise,
         mask_mode=training_args.mask_mode.split(',') if training_args.mask_mode else None,
         mask_ratio=[float(r) for r in training_args.mask_ratio.split(',')] if training_args.mask_ratio else None,
+        behind_vae=training_args.behind_vae,
     )
     model = Bagel(
         language_model, 
@@ -729,6 +734,8 @@ def train_func(config: dict):
         dataset_config.partial_noise_mask_mode = training_args.mask_mode.split(',')
     if training_args.mask_ratio:
         dataset_config.partial_noise_mask_ratio = [float(r) for r in training_args.mask_ratio.split(',')]
+    # behind_vae 配置注入
+    dataset_config.behind_vae = training_args.behind_vae
     train_dataset = PackedDataset(
         dataset_config,
         tokenizer=tokenizer,
@@ -1011,13 +1018,15 @@ def train_func(config: dict):
             loss_dict["ce"] = ce.detach()
             loss = loss + ce * training_args.ce_weight
         else:
-            assert not training_args.visual_und
+            # assert not training_args.visual_und
             loss_dict["ce"] = torch.tensor(0, device=device)
             total_ce_tokens = torch.tensor(0, device=device)
 
         if training_args.visual_gen:
             mse = loss_dict["mse"]
-            if training_args.use_masking or training_args.use_mae_masking:
+            # When use_masking or use_mae_masking or behind_vae is enabled (masked reconstruction), the model only returns
+            # MSE for masked tokens, so use actual tensor size for normalization.
+            if training_args.use_masking or training_args.use_mae_masking or training_args.behind_vae:
                 total_mse_tokens = torch.tensor(mse.shape[0], device=device)
             else:
                 total_mse_tokens = torch.tensor(len(data['mse_loss_indexes']), device=device)

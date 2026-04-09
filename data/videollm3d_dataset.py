@@ -282,11 +282,13 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
         generative_model_id=None,
         generative_feature_source='none',
         add_spatial_instruction=False,
+        behind_vae=False,
     ):
         super().__init__(dataset_name, local_rank, world_size, num_workers)
         self.transform = transform  # VAE transform (stride=16) 或原始 VIT transform
         self.vit_transform = vit_transform  # VIT transform (stride=14)，若提供则启用 VAE 一致性
         self.ref_num = ref_num
+        self.behind_vae = behind_vae
         self.tokenizer = tokenizer
         self.frame_sampler = frame_sampler
         self.data_status = data_status
@@ -596,13 +598,32 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                                     item['value'] = special_tokens + " " + item['value']
                                 break
 
-                        # ── VAE 多视角一致性：在 question 前拼接 VAE token ──
+                        # ── VAE 多视角一致性：拼接 VAE token ──
                         if enable_vae_consistency and len(raw_images) >= 2:
-                            vae_prefix = 'Reconstruct the scene' + '<vae_image>' * len(raw_images)
-                            for item in data_item['conversations']:
-                                if item['from'] == 'human':
-                                    item['value'] = vae_prefix + item['value']
-                                    break
+                            N = len(raw_images)
+                            if self.ref_num == -1:
+                                # ref_num=-1: 从 N//2 和 N//4 中随机选一个
+                                actual_ref_num_local = random.choice([max(1, N // 4), max(1, N // 2)])
+                                actual_ref_num_local = min(actual_ref_num_local, N - 1)
+                            else:
+                                actual_ref_num_local = min(self.ref_num, N - 1)
+                            if self.behind_vae:
+                                # behind_vae 模式：VAE token 放在所有 VIT 之后，只保留 nonref
+                                nonref_count = len(raw_images) - actual_ref_num_local
+                                if nonref_count > 0:
+                                    vae_suffix = '<vae_image>' * nonref_count
+                                    for item in data_item['conversations']:
+                                        if item['from'] == 'human':
+                                            # 直接拼到 human 消息的末尾
+                                            item['value'] = item['value'] + vae_suffix
+                                            break
+                            else:
+                                # 原有模式：VAE token 拼在 question 前面
+                                vae_prefix = 'Reconstruct the scene' + '<vae_image>' * len(raw_images)
+                                for item in data_item['conversations']:
+                                    if item['from'] == 'human':
+                                        item['value'] = vae_prefix + item['value']
+                                        break
 
                 except Exception:
                     traceback.print_exc()
@@ -623,8 +644,13 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                 total_vae_count = 0
                 actual_ref_num = 0
                 if enable_vae_consistency and raw_images and len(raw_images) >= 2:
-                    total_vae_count = len(raw_images)
-                    actual_ref_num = min(self.ref_num, total_vae_count - 1)
+                    # 复用上面已经计算好的 actual_ref_num_local
+                    actual_ref_num = actual_ref_num_local
+                    if self.behind_vae:
+                        # behind_vae 模式：VAE 只保留 nonref
+                        total_vae_count = len(raw_images) - actual_ref_num
+                    else:
+                        total_vae_count = len(raw_images)
 
                 for item in split_list:
                     if item['type'] == 'text':
@@ -646,11 +672,19 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                         # VIT 图片：在遍历时处理 transform，保持与 sequence_plan 顺序一致
                         if raw_images and vit_counter < len(raw_images):
                             raw_image = raw_images[vit_counter]
-                            image_tensor = vit_transform(raw_image, img_num=len(raw_images))
+                            image_tensor = vit_transform(raw_image, img_num=1)
                             image_tensor_list.append(image_tensor)
                             height, width = image_tensor.shape[1:]
                             num_tokens += width * height // vit_stride ** 2
-                            vit_counter += 1
+
+                        # behind_vae 模式下标记 VIT 的 ref/nonref 类型
+                        if self.behind_vae and enable_vae_consistency and actual_ref_num > 0:
+                            if vit_counter < actual_ref_num:
+                                vit_type_label = 'ref'
+                            else:
+                                vit_type_label = 'nonref'
+                        else:
+                            vit_type_label = None
 
                         current_plan = {
                             'type': 'vit_image',
@@ -658,42 +692,74 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                             'loss': 0,
                             'special_token_loss': 0,
                             'special_token_label': None,
+                            'vit_type': vit_type_label,
                         }
+                        if vit_counter < len(raw_images):
+                            vit_counter += 1
                         sequence_plan.append(current_plan)
 
                     elif item['type'] == 'vae':
                         # VAE 图片：使用 VAE transform 处理，区分 ref/nonref
                         if raw_images and vae_counter < total_vae_count:
-                            raw_image = raw_images[vae_counter]
-                            image_tensor = vae_transform(raw_image, img_num=total_vae_count)
-                            image_tensor_list.append(image_tensor)
-                            height, width = image_tensor.shape[1:]
-                            num_tokens += width * height // vae_stride ** 2
+                            if self.behind_vae:
+                                # behind_vae 模式：VAE 只有 nonref，从 raw_images 中取 nonref 帧
+                                raw_image_idx = actual_ref_num + vae_counter
+                                raw_image = raw_images[raw_image_idx]
+                                image_tensor = vae_transform(raw_image, img_num=total_vae_count)
+                                image_tensor_list.append(image_tensor)
+                                height, width = image_tensor.shape[1:]
+                                num_tokens += width * height // vae_stride ** 2
 
-                            # 区分 ref / nonref
-                            if vae_counter < actual_ref_num:
-                                vae_type = 'ref'
-                                loss = 0
-                            else:
                                 vae_type = 'nonref'
                                 loss = 1
 
-                            # video 模式：split_start / split_end / frame_delta
-                            current_plan = {
-                                'type': 'vae_image',
-                                'enable_cfg': 0,
-                                'loss': loss,
-                                'special_token_loss': 0,
-                                'special_token_label': None,
-                                'vae_type': vae_type,
-                                'split_start': vae_counter == 0,
-                                'split_end': vae_counter == total_vae_count - 1,
-                            }
-                            if vae_counter < total_vae_count - 1:
-                                current_plan['frame_delta'] = 1  # 帧间距为 1
+                                current_plan = {
+                                    'type': 'vae_image',
+                                    'enable_cfg': 0,
+                                    'loss': loss,
+                                    'special_token_loss': 0,
+                                    'special_token_label': None,
+                                    'vae_type': vae_type,
+                                    'split_start': vae_counter == 0,
+                                    'split_end': vae_counter == total_vae_count - 1,
+                                }
+                                if vae_counter < total_vae_count - 1:
+                                    current_plan['frame_delta'] = 1
 
-                            sequence_plan.append(current_plan)
-                            vae_counter += 1
+                                sequence_plan.append(current_plan)
+                                vae_counter += 1
+                            else:
+                                # 原有模式：包含 ref 和 nonref
+                                raw_image = raw_images[vae_counter]
+                                image_tensor = vae_transform(raw_image, img_num=total_vae_count)
+                                image_tensor_list.append(image_tensor)
+                                height, width = image_tensor.shape[1:]
+                                num_tokens += width * height // vae_stride ** 2
+
+                                # 区分 ref / nonref
+                                if vae_counter < actual_ref_num:
+                                    vae_type = 'ref'
+                                    loss = 0
+                                else:
+                                    vae_type = 'nonref'
+                                    loss = 1
+
+                                # video 模式：split_start / split_end / frame_delta
+                                current_plan = {
+                                    'type': 'vae_image',
+                                    'enable_cfg': 0,
+                                    'loss': loss,
+                                    'special_token_loss': 0,
+                                    'special_token_label': None,
+                                    'vae_type': vae_type,
+                                    'split_start': vae_counter == 0,
+                                    'split_end': vae_counter == total_vae_count - 1,
+                                }
+                                if vae_counter < total_vae_count - 1:
+                                    current_plan['frame_delta'] = 1  # 帧间距为 1
+
+                                sequence_plan.append(current_plan)
+                                vae_counter += 1
 
                 has_loss = [item['loss'] for item in sequence_plan]
                 if sum(has_loss) == 0:

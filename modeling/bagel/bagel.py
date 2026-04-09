@@ -14,7 +14,8 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from data.data_utils import (
-    create_sparse_mask, 
+    create_sparse_mask,
+    create_behind_vae_sparse_mask,
     get_flattened_position_ids_extrapolate, 
     get_flattened_position_ids_interpolate,
     patchify, 
@@ -154,6 +155,7 @@ class BagelConfig(PretrainedConfig):
         use_partial_noise=False,
         mask_mode=None,
         mask_ratio=None,
+        behind_vae=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -173,6 +175,7 @@ class BagelConfig(PretrainedConfig):
         self.use_partial_noise = use_partial_noise
         self.mask_mode = mask_mode if mask_mode is not None else ['random']
         self.mask_ratio = mask_ratio if mask_ratio is not None else [0.75]
+        self.behind_vae = behind_vae
 
 
 class Bagel(PreTrainedModel):
@@ -202,8 +205,24 @@ class Bagel(PreTrainedModel):
             self.use_masking = config.use_masking
             self.use_mae_masking = config.use_mae_masking
             self.use_partial_noise = config.use_partial_noise
+            self.behind_vae = config.behind_vae
             self.mask_mode = config.mask_mode
             self.mask_ratio = config.mask_ratio
+
+            # 模式互斥检查：behind_vae 与 use_masking、use_mae_masking、use_partial_noise 互斥
+            if self.behind_vae:
+                conflicting = []
+                if self.use_masking:
+                    conflicting.append('use_masking')
+                if self.use_mae_masking:
+                    conflicting.append('use_mae_masking')
+                if self.use_partial_noise:
+                    conflicting.append('use_partial_noise')
+                if conflicting:
+                    raise ValueError(
+                        f"behind_vae 模式与以下模式互斥，不能同时启用: {conflicting}"
+                    )
+
             if self.use_masking:
                 # Learnable placeholder embedding for masked positions (use_masking mode only).
                 self.vae_mask_placeholder = nn.Parameter(torch.zeros(self.hidden_size))
@@ -266,6 +285,9 @@ class Bagel(PreTrainedModel):
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
         packed_vae_types: Optional[List[str]] = None,
         packed_vit_types: Optional[List[str]] = None,
+        # behind_vae 模式的额外参数
+        behind_vae_masked_vit_indexes: Optional[torch.LongTensor] = None,
+        behind_vae_vae_token_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -297,7 +319,17 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
-            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
+            # behind_vae 模式使用 token-level mask
+            if behind_vae_masked_vit_indexes is not None and behind_vae_vae_token_ranges is not None:
+                sparse_mask = create_behind_vae_sparse_mask(
+                    sample_lens, split_lens, attn_modes,
+                    behind_vae_masked_vit_indexes,
+                    behind_vae_vae_token_ranges,
+                    packed_vit_token_indexes,
+                    packed_text_embedding.device
+                )
+            else:
+                sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
             seqlen = sum(sample_lens)
             block_mask = create_block_mask(
                 sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
@@ -553,6 +585,24 @@ class Bagel(PreTrainedModel):
                 latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
                 packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
                 packed_sequence[packed_vae_token_indexes] = packed_latent
+            elif self.behind_vae and packed_vae_types is not None:
+                # === Behind-VAE Mode ===
+                #
+                # VAE token 放在 VIT 后面，只有 nonref。
+                # packed_timesteps 已在数据侧设置：
+                #   - 被 mask 的 nonref token: timestep = 正常采样值 → sigmoid 后 > 0（加噪）
+                #   - 未被 mask 的 nonref token: timestep = -inf → sigmoid 后 ≈ 0（clean）
+                #
+                # 与 partial_noise 相同的 flow-matching 公式。
+
+                noise = torch.randn_like(packed_latent_clean)
+                packed_timesteps = torch.sigmoid(packed_timesteps)
+                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
+                packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
+                packed_timestep_embeds = self.time_embedder(packed_timesteps)
+                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
+                packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
+                packed_sequence[packed_vae_token_indexes] = packed_latent
             else:
                 # === Original Flow-Matching Mode ===
                 noise = torch.randn_like(packed_latent_clean)
@@ -622,6 +672,14 @@ class Bagel(PreTrainedModel):
             elif self.use_partial_noise and packed_vae_types is not None:
                 # === Partial Noise Loss ===
                 # mse_loss_indexes 仅包含被 mask 的 nonref token 位置（在数据侧已设置）。
+                # 只在这些位置计算 velocity target v = noise - clean。
+                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
+                target = noise - packed_latent_clean  # v_t = ε - x_0
+                has_mse = packed_timesteps > 0
+                mse = (packed_mse_preds - target[has_mse]) ** 2
+            elif self.behind_vae and packed_vae_types is not None:
+                # === Behind-VAE Loss ===
+                # mse_loss_indexes 仅包含被 mask 的 nonref VAE token 位置（在数据侧已设置）。
                 # 只在这些位置计算 velocity target v = noise - clean。
                 packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
                 target = noise - packed_latent_clean  # v_t = ε - x_0

@@ -37,6 +37,114 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
     return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
 
 
+def create_behind_vae_sparse_mask(
+    document_lens, split_lens, attn_modes,
+    behind_vae_masked_vit_indexes, behind_vae_vae_token_ranges,
+    packed_vit_token_indexes,
+    device
+):
+    """
+    构造 behind_vae 模式的 token-level flex attention mask。
+    
+    Attention 规则：
+    - VIT token 之间：full bidirectional attention（所有 VIT image token 互相可见）
+    - VAE token 之间：full bidirectional attention
+    - VAE → VIT：VAE token 只能看到前面的 VIT token（未被 mask 的）；被 mask 的 VIT token 对 VAE 不可见
+    - VAE → Text：VAE token 不允许看到任何 text token
+    - Text → VAE：Text token 不允许看到任何 VAE token
+    - Text token 之间：causal attention
+    - 不同 sample 之间完全隔离
+    
+    Args:
+        document_lens: 每个 sample 的长度列表
+        split_lens: 每个 split 的长度列表
+        attn_modes: 每个 split 的 attention 模式 ('full', 'causal', 'noise')
+        behind_vae_masked_vit_indexes: 被 mask 的 VIT token 全局索引 (tensor)
+        behind_vae_vae_token_ranges: VAE token 范围列表 [(start, end), ...]
+        packed_vit_token_indexes: VIT token 的全局索引 (tensor)
+        device: 设备
+    """
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    def full_and_noise_mask(b, h, q_idx, kv_idx):
+        return (full_and_noise_seq_id[q_idx] == full_and_noise_seq_id[kv_idx]) & (full_and_noise_seq_id[q_idx] >= 0)
+
+    def remove_noise_mask(b, h, q_idx, kv_idx):
+        return (~((noise_seq_id[kv_idx] >= 0) & (noise_seq_id[q_idx] != noise_seq_id[kv_idx])))
+
+    def sample_mask(b, h, q_idx, kv_idx):
+        return document_id[q_idx] == document_id[kv_idx]
+
+    def vae_no_masked_vit_mask(b, h, q_idx, kv_idx):
+        """VAE token 不能看到被 mask 的 VIT token（防止信息泄露）"""
+        # 当 q 是 VAE token 且 kv 是被 mask 的 VIT token 时返回 False
+        q_is_vae = is_vae_token[q_idx]
+        kv_is_masked_vit = is_masked_vit_token[kv_idx]
+        return ~(q_is_vae & kv_is_masked_vit)
+
+    def text_no_vae_mask(b, h, q_idx, kv_idx):
+        """Text token 不允许看到任何 VAE token"""
+        # 当 kv 是 VAE token 且 q 不是 VAE token 时返回 False
+        q_is_vae = is_vae_token[q_idx]
+        kv_is_vae = is_vae_token[kv_idx]
+        return ~(~q_is_vae & kv_is_vae)
+
+    def vae_only_see_vit_mask(b, h, q_idx, kv_idx):
+        """VAE token 只能看到 VIT token 和其他 VAE token，不能看到 text token"""
+        # 当 q 是 VAE token 且 kv 既不是 VIT token 也不是 VAE token（即 kv 是 text token）时返回 False
+        q_is_vae = is_vae_token[q_idx]
+        kv_is_vit = is_vit_token[kv_idx]
+        kv_is_vae = is_vae_token[kv_idx]
+        return ~(q_is_vae & ~kv_is_vit & ~kv_is_vae)
+
+    # 构造 split-level 辅助 tensor（复用现有逻辑）
+    full_and_noise_tmp = []
+    noise_tmp = []
+    for i, (length, mode) in enumerate(zip(split_lens, attn_modes)):
+        value = i if mode in ['full', 'noise'] else -1
+        full_and_noise_tmp.extend([value] * length)
+        value_noise = i if mode == 'noise' else -1
+        noise_tmp.extend([value_noise] * length)
+
+    full_and_noise_seq_id = torch.Tensor(full_and_noise_tmp).to(device)
+    noise_seq_id = torch.Tensor(noise_tmp).to(device)
+    document_id = torch.cat([torch.full((l,), i) for i, l in enumerate(document_lens, start=1)]).to(device)
+
+    # 构造 token-level 辅助 tensor
+    total_len = sum(split_lens)
+    
+    # is_vae_token: 标记哪些位置是 VAE token
+    is_vae_token_tmp = torch.zeros(total_len, dtype=torch.bool)
+    for start, end in behind_vae_vae_token_ranges:
+        if start < total_len and end <= total_len:
+            is_vae_token_tmp[start:end] = True
+    is_vae_token = is_vae_token_tmp.to(device)
+
+    # is_masked_vit_token: 标记哪些位置是被 mask 的 VIT token
+    is_masked_vit_token_tmp = torch.zeros(total_len, dtype=torch.bool)
+    if behind_vae_masked_vit_indexes is not None and len(behind_vae_masked_vit_indexes) > 0:
+        valid_indexes = behind_vae_masked_vit_indexes[behind_vae_masked_vit_indexes < total_len]
+        is_masked_vit_token_tmp[valid_indexes] = True
+    is_masked_vit_token = is_masked_vit_token_tmp.to(device)
+
+    # is_vit_token: 标记哪些位置是 VIT token（包括 ref 和 nonref）
+    is_vit_token_tmp = torch.zeros(total_len, dtype=torch.bool)
+    if packed_vit_token_indexes is not None and len(packed_vit_token_indexes) > 0:
+        valid_vit_indexes = packed_vit_token_indexes[packed_vit_token_indexes < total_len]
+        is_vit_token_tmp[valid_vit_indexes] = True
+    is_vit_token = is_vit_token_tmp.to(device)
+
+    return and_masks(
+        or_masks(causal_mask, full_and_noise_mask),
+        remove_noise_mask,
+        sample_mask,
+        vae_no_masked_vit_mask,
+        text_no_vae_mask,
+        vae_only_see_vit_mask,
+    )
+
+
 def patchify(image, patch_size):
     p = patch_size
     c, h, w = image.shape

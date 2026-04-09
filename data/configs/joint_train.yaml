@@ -153,7 +153,7 @@ videollm3d:
     image_stride: 14
     max_image_size: 384
     min_image_size: 256
-  ref_num: 2
+  ref_num: -1
   frame_sampler_args:
     max_num_frames: 12
     min_num_frames: 8
@@ -176,8 +176,8 @@ videollm3d:
   max_xyz_range: [15, 15, 5]
   frame_sampling_strategy: uniform
   val_box_type: pred
-  force_sample: false
-  frames_upbound: 0
+  force_sample: true
+  frames_upbound: 32
   generative_model_id: null
   generative_feature_source: none
   add_spatial_instruction: false

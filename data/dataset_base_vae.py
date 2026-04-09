@@ -113,6 +113,52 @@ def generate_mask_numpy(H, W, ratio, mode='rectangle', ar_range=(0.3, 3.0)):
     return mask
 
 
+def map_vae_mask_to_vit(vae_mask, img_h, img_w, vae_stride, vit_stride):
+    """
+    将 VAE 空间的 mask 映射到 VIT 空间。
+    
+    对于 VIT 空间的每个 patch (i, j)，计算其覆盖的像素区域
+    [i*vit_stride, (i+1)*vit_stride) x [j*vit_stride, (j+1)*vit_stride)，
+    检查该区域是否与任何被 mask 的 VAE patch 的像素区域有重叠，
+    若有则标记为 masked。
+    
+    Args:
+        vae_mask: (h_vae, w_vae) numpy array, 1=masked, 0=visible
+        img_h: 原始图片高度（像素）
+        img_w: 原始图片宽度（像素）
+        vae_stride: VAE 的 patch stride（如 16）
+        vit_stride: VIT 的 patch stride（如 14）
+    
+    Returns:
+        vit_mask: (h_vit, w_vit) numpy array, 1=masked, 0=visible
+    """
+    h_vae, w_vae = vae_mask.shape
+    h_vit = img_h // vit_stride
+    w_vit = img_w // vit_stride
+    
+    vit_mask = np.zeros((h_vit, w_vit), dtype=np.uint8)
+    
+    for vi in range(h_vit):
+        for vj in range(w_vit):
+            # VIT patch 覆盖的像素区域
+            vit_y_start = vi * vit_stride
+            vit_y_end = (vi + 1) * vit_stride
+            vit_x_start = vj * vit_stride
+            vit_x_end = (vj + 1) * vit_stride
+            
+            # 找到与该 VIT patch 重叠的 VAE patch 范围
+            vae_i_start = max(0, vit_y_start // vae_stride)
+            vae_i_end = min(h_vae, (vit_y_end - 1) // vae_stride + 1)
+            vae_j_start = max(0, vit_x_start // vae_stride)
+            vae_j_end = min(w_vae, (vit_x_end - 1) // vae_stride + 1)
+            
+            # 检查是否有任何重叠的 VAE patch 被 mask
+            if np.any(vae_mask[vae_i_start:vae_i_end, vae_j_start:vae_j_end]):
+                vit_mask[vi, vj] = 1
+    
+    return vit_mask
+
+
 class DataConfig:
     def __init__(
         self, 
@@ -128,6 +174,8 @@ class DataConfig:
         use_partial_noise=False,
         partial_noise_mask_mode=None,
         partial_noise_mask_ratio=None,
+        # behind_vae 模式开关
+        behind_vae=False,
     ):
         self.grouped_datasets = grouped_datasets
         self.text_cond_dropout_prob = text_cond_dropout_prob
@@ -141,6 +189,8 @@ class DataConfig:
         self.use_partial_noise = use_partial_noise
         self.partial_noise_mask_mode = partial_noise_mask_mode if partial_noise_mask_mode is not None else ['random']
         self.partial_noise_mask_ratio = partial_noise_mask_ratio if partial_noise_mask_ratio is not None else [0.75]
+        # behind_vae 模式：VAE token 放在 VIT 后面，只保留 nonref，做 masked denoise
+        self.behind_vae = behind_vae
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -175,6 +225,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
         for k, v in special_tokens.items():
             setattr(self, k, v)
 
+        self.data_config = data_config
         grouped_names, grouped_datasets, is_mandatory, grouped_weights = self.build_datasets(
             data_config.grouped_datasets, data_status
         )
@@ -182,7 +233,6 @@ class PackedDataset(torch.utils.data.IterableDataset):
         self.dataset_iters = [(iter(dataset), grouped_name, dataset) for (dataset, grouped_name) in zip(grouped_datasets, grouped_names)]
         self.is_mandatory = is_mandatory
         self.grouped_weights = grouped_weights
-        self.data_config = data_config
         self.interpolate_pos = interpolate_pos
         if self.interpolate_pos:
             self.get_flattened_position_ids = get_flattened_position_ids_interpolate
@@ -253,6 +303,8 @@ class PackedDataset(torch.utils.data.IterableDataset):
                         dataset_args['jsonl_path_list'].append(meta_info['jsonl_path'])
 
             resume_data_status = dataset_args.pop('resume_data_status', True)
+            # 注入 behind_vae 配置到子数据集
+            dataset_args['behind_vae'] = self.data_config.behind_vae
             if data_status is not None and grouped_dataset_name in data_status.keys() and resume_data_status:
                 data_status_per_group = data_status[grouped_dataset_name]
             else:
@@ -301,6 +353,10 @@ class PackedDataset(torch.utils.data.IterableDataset):
             vit_latent_shapes           = list(),
             packed_vae_types            = list(),
             packed_vit_types            = list(),
+            # behind_vae 模式的额外字段
+            behind_vae_masked_vit_indexes = list(),  # 被 mask 的 VIT token 全局索引
+            behind_vae_vae_token_ranges   = list(),  # VAE token 在 packed_sequence 中的范围 (start, end)
+            behind_vae_nonref_vit_info    = list(),  # nonref VIT 的 (token_start_idx, num_tokens) 列表
         )
         return sequence_status
 
@@ -361,6 +417,14 @@ class PackedDataset(torch.utils.data.IterableDataset):
             data['packed_label_ids'] = torch.tensor(sequence_status['packed_label_ids'])
             data['ce_loss_indexes'] = torch.tensor(sequence_status['ce_loss_indexes'])
             data['ce_loss_weights'] = torch.tensor(sequence_status['ce_loss_weights'])
+
+        # behind_vae 模式的额外字段
+        if len(sequence_status['behind_vae_masked_vit_indexes']) > 0:
+            data['behind_vae_masked_vit_indexes'] = torch.tensor(
+                sequence_status['behind_vae_masked_vit_indexes'], dtype=torch.long
+            )
+        if len(sequence_status['behind_vae_vae_token_ranges']) > 0:
+            data['behind_vae_vae_token_ranges'] = sequence_status['behind_vae_vae_token_ranges']
 
         return data
 
@@ -487,6 +551,9 @@ class PackedDataset(torch.utils.data.IterableDataset):
         sample_lens = 0
         vit_cnt = 0
         vae_cnt = 0
+        vit_token_total = 0   # 统计当前样本的 VIT token 总数
+        vae_token_total = 0   # 统计当前样本的 VAE token 总数
+        text_token_total = 0  # 统计当前样本的 text token 总数
         # partial noise 模式下，同一 video split 内共享的 mask 参数
         cur_mask_mode = None
         cur_mask_ratio = None
@@ -510,6 +577,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                         [len2weight(len(shifted_text_ids))] * len(shifted_text_ids)
                     )
                     sequence_status['packed_label_ids'].extend(text_ids + [self.eos_token_id])
+                text_token_total += len(shifted_text_ids)
                 curr += len(shifted_text_ids)
                 curr_split_len += len(shifted_text_ids)
 
@@ -545,6 +613,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 # preprocess image
                 vit_tokens = patchify(image_tensor, self.data_config.vit_patch_size)
                 num_img_tokens = vit_tokens.shape[0]
+                vit_token_total += num_img_tokens
                 sequence_status['packed_vit_token_indexes'].extend(range(curr, curr + num_img_tokens))
                 curr += num_img_tokens
                 curr_split_len += num_img_tokens
@@ -553,6 +622,15 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 sequence_status['vit_token_seqlens'].append(num_img_tokens)
                 vit_type = item.get('vit_type', None)
                 sequence_status['packed_vit_types'].extend([vit_type] * num_img_tokens)
+
+                # behind_vae 模式：记录 nonref VIT 的 token 起始索引和数量
+                if self.data_config.behind_vae and vit_type == 'nonref':
+                    # curr 已经移动到 image tokens 之后，所以起始索引是 curr - num_img_tokens
+                    vit_token_start = curr - num_img_tokens
+                    sequence_status['behind_vae_nonref_vit_info'].append(
+                        (vit_token_start, num_img_tokens)
+                    )
+
                 h_vit = image_tensor.size(1) // self.data_config.vit_patch_size
                 w_vit = image_tensor.size(2) // self.data_config.vit_patch_size
                 sequence_status['vit_latent_shapes'].append((h_vit, w_vit))
@@ -612,7 +690,62 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
                 vae_type = item.get('vae_type', None)
 
-                if self.data_config.use_partial_noise and vae_type in ('ref', 'nonref'):
+                if self.data_config.behind_vae and vae_type == 'nonref':
+                    # === Behind-VAE 模式 ===
+                    # 所有 VAE 都是 nonref，生成空间 mask，被 mask 的 token 加噪
+                    if split_start or cur_mask_mode is None:
+                        # 整个 sample 共享一个 timestep 和 mask 参数
+                        timestep = np.random.randn()
+                        mask_idx = random.randint(0, len(self.data_config.partial_noise_mask_mode) - 1)
+                        cur_mask_mode = self.data_config.partial_noise_mask_mode[mask_idx]
+                        cur_mask_ratio = self.data_config.partial_noise_mask_ratio[mask_idx]
+
+                    # 生成 VAE 空间 mask: (h, w), 1=masked, 0=visible
+                    spatial_mask = generate_mask_numpy(h, w, cur_mask_ratio, mode=cur_mask_mode)
+                    mask_flat = spatial_mask.flatten()  # (h*w,)
+
+                    # 为每个 VAE token 设置 timestep
+                    token_timesteps = []
+                    token_range = list(range(curr, curr + num_img_tokens))
+                    for tok_idx, is_masked in zip(token_range, mask_flat):
+                        if is_masked:
+                            token_timesteps.append(timestep)
+                            sequence_status['mse_loss_indexes'].append(tok_idx)
+                        else:
+                            token_timesteps.append(float('-inf'))
+                    sequence_status['packed_timesteps'].extend(token_timesteps)
+
+                    # VAE mask → VIT mask 跨分辨率映射
+                    # 找到对应的 nonref VIT image 的 token 索引
+                    # behind_vae 模式下，vae_cnt-1 对应的 nonref VIT image 索引
+                    # VIT 包含所有帧（ref + nonref），nonref 从 actual_ref_num 开始
+                    # 但我们需要知道 actual_ref_num，从 sequence_plan 中推断
+                    vit_mask = map_vae_mask_to_vit(
+                        spatial_mask, H, W,
+                        self.data_config.vae_image_downsample,
+                        self.data_config.vit_patch_size,
+                    )
+                    vit_mask_flat = vit_mask.flatten()
+                    # 记录被 mask 的 VIT token 的全局索引
+                    # 需要找到对应 nonref VIT image 在 packed_vit_token_indexes 中的位置
+                    # behind_vae_nonref_vit_info 记录了每个 nonref VIT 的 token 起始索引和数量
+                    if 'behind_vae_nonref_vit_info' in sequence_status:
+                        nonref_vit_infos = sequence_status['behind_vae_nonref_vit_info']
+                        if len(nonref_vit_infos) > 0:
+                            # vae_cnt-1 对应第 vae_cnt-1 个 nonref VIT
+                            nonref_idx = vae_cnt - 1
+                            if nonref_idx < len(nonref_vit_infos):
+                                vit_start_idx, vit_num_tokens = nonref_vit_infos[nonref_idx]
+                                for vi, is_masked in enumerate(vit_mask_flat):
+                                    if is_masked and vi < vit_num_tokens:
+                                        sequence_status['behind_vae_masked_vit_indexes'].append(
+                                            vit_start_idx + vi
+                                        )
+
+                    # 记录 VAE token 范围
+                    sequence_status['behind_vae_vae_token_ranges'].append((curr, curr + num_img_tokens))
+
+                elif self.data_config.use_partial_noise and vae_type in ('ref', 'nonref'):
                     # === Partial Noise 模式 ===
                     # ref: 所有 token 保持 clean（timestep=-inf），不参与 loss
                     # nonref: 被 mask 的 token 加噪（正常 timestep），未被 mask 的保持 clean
@@ -659,6 +792,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     sequence_status['packed_timesteps'].extend([timestep] * num_img_tokens)
 
                 sequence_status['packed_vae_types'].extend([vae_type] * num_img_tokens)
+                vae_token_total += num_img_tokens
                 curr += num_img_tokens
                 curr_split_len += num_img_tokens
 
@@ -691,6 +825,14 @@ class PackedDataset(torch.utils.data.IterableDataset):
 
         sequence_status['curr'] = curr
         sequence_status['sample_lens'].append(sample_lens)
+
+        # 打印当前样本的 token 分布
+        print(f"[PackSequence] sample_tokens={sample_lens}, "
+              f"vit_images={vit_cnt}, vit_tokens={vit_token_total}, "
+              f"vae_images={vae_cnt}, vae_tokens={vae_token_total}, "
+              f"text_tokens={text_token_total}, "
+              f"total_packed={curr}")
+
         # prepare attention mask
         if not self.use_flex:
             sequence_status['nested_attention_masks'].append(
@@ -749,6 +891,12 @@ class SimpleCustomBatch:
             self.ce_loss_indexes = data["ce_loss_indexes"]
             self.ce_loss_weights = data["ce_loss_weights"]
 
+        # behind_vae 模式的额外字段
+        if "behind_vae_masked_vit_indexes" in data.keys():
+            self.behind_vae_masked_vit_indexes = data["behind_vae_masked_vit_indexes"]
+        if "behind_vae_vae_token_ranges" in data.keys():
+            self.behind_vae_vae_token_ranges = data["behind_vae_vae_token_ranges"]
+
     def pin_memory(self):
         self.packed_text_ids = self.packed_text_ids.pin_memory()
         self.packed_text_indexes = self.packed_text_indexes.pin_memory()
@@ -776,6 +924,9 @@ class SimpleCustomBatch:
             self.packed_label_ids = self.packed_label_ids.pin_memory()
             self.ce_loss_indexes = self.ce_loss_indexes.pin_memory()
             self.ce_loss_weights = self.ce_loss_weights.pin_memory()
+
+        if hasattr(self, 'behind_vae_masked_vit_indexes'):
+            self.behind_vae_masked_vit_indexes = self.behind_vae_masked_vit_indexes.pin_memory()
 
         return self
 
@@ -806,6 +957,9 @@ class SimpleCustomBatch:
             self.packed_label_ids = self.packed_label_ids.to(device)
             self.ce_loss_indexes = self.ce_loss_indexes.to(device)
             self.ce_loss_weights = self.ce_loss_weights.to(device)
+
+        if hasattr(self, 'behind_vae_masked_vit_indexes'):
+            self.behind_vae_masked_vit_indexes = self.behind_vae_masked_vit_indexes.to(device)
 
         return self
 
@@ -853,6 +1007,11 @@ class SimpleCustomBatch:
             data['packed_label_ids'] = self.packed_label_ids
             data['ce_loss_indexes'] = self.ce_loss_indexes
             data['ce_loss_weights'] = self.ce_loss_weights
+
+        if hasattr(self, 'behind_vae_masked_vit_indexes'):
+            data['behind_vae_masked_vit_indexes'] = self.behind_vae_masked_vit_indexes
+        if hasattr(self, 'behind_vae_vae_token_ranges'):
+            data['behind_vae_vae_token_ranges'] = self.behind_vae_vae_token_ranges
 
         return data
 
