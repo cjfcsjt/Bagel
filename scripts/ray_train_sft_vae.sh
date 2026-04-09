@@ -37,7 +37,7 @@ export WANDB_PROJECT="bagel-sft-training-sh"     # 你可以选择一个项目�
 # export NCCL_IB_HCA="mlx5_0"
 # export NCCL_P2P_LEVEL="NVL"
 
-RUNID=159
+RUNID=160
 
 # =====================================================================
 # 前置步骤：在每个节点的 conda 环境中启动独立的 Ray 集群
@@ -92,7 +92,7 @@ export RAY_ADDRESS="172.16.4.24:6380"  # TODO: 替换为你的 Head 节点 IP
   --checkpoint_dir $HOME/code/ckpt/joint_vae_geo_then_und_videollm3d_partial_masking_denoise_behind_vae_${RUNID} \
   --save_every 200 \
   --log_every 10 \
-  --gradient_accumulation_steps 2 \
+  --gradient_accumulation_steps 8 \
   --lr 2e-5 \
   --max_latent_size 64  \
   --wandb_runid ${RUNID} \
