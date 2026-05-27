@@ -14,8 +14,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
 from data.data_utils import (
-    create_sparse_mask,
-    create_behind_vae_sparse_mask,
+    create_sparse_mask, 
     get_flattened_position_ids_extrapolate, 
     get_flattened_position_ids_interpolate,
     patchify, 
@@ -152,10 +151,8 @@ class BagelConfig(PretrainedConfig):
         timestep_shift=1.0,
         use_masking=False,
         use_mae_masking=False,
-        use_partial_noise=False,
         mask_mode=None,
         mask_ratio=None,
-        behind_vae=False,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -172,10 +169,8 @@ class BagelConfig(PretrainedConfig):
         self.timestep_shift = timestep_shift
         self.use_masking = use_masking
         self.use_mae_masking = use_mae_masking
-        self.use_partial_noise = use_partial_noise
         self.mask_mode = mask_mode if mask_mode is not None else ['random']
         self.mask_ratio = mask_ratio if mask_ratio is not None else [0.75]
-        self.behind_vae = behind_vae
 
 
 class Bagel(PreTrainedModel):
@@ -204,25 +199,8 @@ class Bagel(PreTrainedModel):
             # Masked reconstruction support
             self.use_masking = config.use_masking
             self.use_mae_masking = config.use_mae_masking
-            self.use_partial_noise = config.use_partial_noise
-            self.behind_vae = config.behind_vae
             self.mask_mode = config.mask_mode
             self.mask_ratio = config.mask_ratio
-
-            # 模式互斥检查：behind_vae 与 use_masking、use_mae_masking、use_partial_noise 互斥
-            if self.behind_vae:
-                conflicting = []
-                if self.use_masking:
-                    conflicting.append('use_masking')
-                if self.use_mae_masking:
-                    conflicting.append('use_mae_masking')
-                if self.use_partial_noise:
-                    conflicting.append('use_partial_noise')
-                if conflicting:
-                    raise ValueError(
-                        f"behind_vae 模式与以下模式互斥，不能同时启用: {conflicting}"
-                    )
-
             if self.use_masking:
                 # Learnable placeholder embedding for masked positions (use_masking mode only).
                 self.vae_mask_placeholder = nn.Parameter(torch.zeros(self.hidden_size))
@@ -285,9 +263,6 @@ class Bagel(PreTrainedModel):
         mse_loss_indexes: Optional[torch.BoolTensor] = None,
         packed_vae_types: Optional[List[str]] = None,
         packed_vit_types: Optional[List[str]] = None,
-        # behind_vae 模式的额外参数
-        behind_vae_masked_vit_indexes: Optional[torch.LongTensor] = None,
-        behind_vae_vae_token_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -319,17 +294,7 @@ class Bagel(PreTrainedModel):
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
         if nested_attention_masks is None:
-            # behind_vae 模式使用 token-level mask
-            if behind_vae_masked_vit_indexes is not None and behind_vae_vae_token_ranges is not None:
-                sparse_mask = create_behind_vae_sparse_mask(
-                    sample_lens, split_lens, attn_modes,
-                    behind_vae_masked_vit_indexes,
-                    behind_vae_vae_token_ranges,
-                    packed_vit_token_indexes,
-                    packed_text_embedding.device
-                )
-            else:
-                sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
+            sparse_mask = create_sparse_mask(sample_lens, split_lens, attn_modes, packed_text_embedding.device)
             seqlen = sum(sample_lens)
             block_mask = create_block_mask(
                 sparse_mask, B=1, H=self.num_heads, Q_LEN=seqlen, KV_LEN=seqlen, 
@@ -339,7 +304,7 @@ class Bagel(PreTrainedModel):
         else:
             attention_mask = nested_attention_masks
 
-        if self.config.visual_und and vit_token_seqlens is not None:
+        if self.config.visual_und:
             cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
             cu_seqlens = cu_seqlens.to(torch.int32)
             max_seqlen = torch.max(vit_token_seqlens).item()
@@ -565,44 +530,6 @@ class Bagel(PreTrainedModel):
                             masked_vit_indexes = vit_global_indexes[mask_flat]
                             packed_sequence[masked_vit_indexes] = self.vit_mask_placeholder
                         vit_token_offset += vit_seqlen
-            elif self.use_partial_noise and packed_vae_types is not None:
-                # === Partial Noise Mode ===
-                #
-                # 所有 VAE token 在一个 video split 中（full 双向注意力）。
-                # packed_timesteps 已在数据侧设置：
-                #   - ref token 和 nonref 未 mask token: timestep = -inf → sigmoid 后 ≈ 0（clean）
-                #   - nonref 被 mask 的 token: timestep = 正常采样值 → sigmoid 后 > 0（加噪）
-                #
-                # 统一执行 flow-matching 公式：x_t = (1 - t) * clean + t * noise
-                # clean token 的 t ≈ 0，自然保持 x_t ≈ clean
-                # target token 的 t > 0，正常加噪
-
-                noise = torch.randn_like(packed_latent_clean)
-                packed_timesteps = torch.sigmoid(packed_timesteps)
-                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
-                packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
-                packed_timestep_embeds = self.time_embedder(packed_timesteps)
-                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
-                packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
-                packed_sequence[packed_vae_token_indexes] = packed_latent
-            elif self.behind_vae and packed_vae_types is not None:
-                # === Behind-VAE Mode ===
-                #
-                # VAE token 放在 VIT 后面，只有 nonref。
-                # packed_timesteps 已在数据侧设置：
-                #   - 被 mask 的 nonref token: timestep = 正常采样值 → sigmoid 后 > 0（加噪）
-                #   - 未被 mask 的 nonref token: timestep = -inf → sigmoid 后 ≈ 0（clean）
-                #
-                # 与 partial_noise 相同的 flow-matching 公式。
-
-                noise = torch.randn_like(packed_latent_clean)
-                packed_timesteps = torch.sigmoid(packed_timesteps)
-                packed_timesteps = self.timestep_shift * packed_timesteps / (1 + (self.timestep_shift - 1) * packed_timesteps)
-                packed_latent = (1 - packed_timesteps[:, None]) * packed_latent_clean + packed_timesteps[:, None] * noise
-                packed_timestep_embeds = self.time_embedder(packed_timesteps)
-                latent_token_pos_emb = self.latent_pos_embed(packed_latent_position_ids)
-                packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + latent_token_pos_emb
-                packed_sequence[packed_vae_token_indexes] = packed_latent
             else:
                 # === Original Flow-Matching Mode ===
                 noise = torch.randn_like(packed_latent_clean)
@@ -665,22 +592,6 @@ class Bagel(PreTrainedModel):
                 # 和普通 t2i 完全一样。MAE 的效果完全通过 VIT masking 来实现：
                 # nonref 的 VIT condition 被 mask 了，模型需要从不完整的 condition
                 # 中学会去噪/重建。
-                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-                target = noise - packed_latent_clean  # v_t = ε - x_0
-                has_mse = packed_timesteps > 0
-                mse = (packed_mse_preds - target[has_mse]) ** 2
-            elif self.use_partial_noise and packed_vae_types is not None:
-                # === Partial Noise Loss ===
-                # mse_loss_indexes 仅包含被 mask 的 nonref token 位置（在数据侧已设置）。
-                # 只在这些位置计算 velocity target v = noise - clean。
-                packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
-                target = noise - packed_latent_clean  # v_t = ε - x_0
-                has_mse = packed_timesteps > 0
-                mse = (packed_mse_preds - target[has_mse]) ** 2
-            elif self.behind_vae and packed_vae_types is not None:
-                # === Behind-VAE Loss ===
-                # mse_loss_indexes 仅包含被 mask 的 nonref VAE token 位置（在数据侧已设置）。
-                # 只在这些位置计算 velocity target v = noise - clean。
                 packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
                 target = noise - packed_latent_clean  # v_t = ε - x_0
                 has_mse = packed_timesteps > 0
@@ -884,132 +795,6 @@ class Bagel(PreTrainedModel):
         past_key_values = output.past_key_values
 
         return past_key_values
-
-    @torch.no_grad
-    def forward_cache_update_vit_masked(
-        self,
-        past_key_values: NaiveCache,
-        packed_text_ids: torch.LongTensor,
-        packed_text_indexes: torch.LongTensor,
-        packed_vit_tokens: torch.Tensor,
-        packed_vit_token_indexes: torch.LongTensor,
-        packed_vit_position_ids: torch.LongTensor,
-        vit_token_seqlens: torch.IntTensor,
-        packed_position_ids: torch.LongTensor,
-        packed_seqlens: torch.IntTensor,
-        packed_indexes: torch.LongTensor,
-        packed_key_value_indexes: torch.LongTensor,
-        key_values_lens: torch.IntTensor,
-        vit_mask_flat: torch.BoolTensor = None,
-    ):
-        """
-        带 mask 的 VIT KV cache 更新。
-        
-        与 forward_cache_update_vit 的区别：
-        - VIT encoder 仍然处理完整图片（VIT 内部 self-attention 需要完整上下文）
-        - 在 VIT encoder 输出后、写入 LLM KV cache 前，将被 mask 的 VIT patch
-          从 packed_sequence 中移除（不写入 KV cache）
-        - 这与训练时 attention mask 屏蔽被 mask 的 VIT token 完全等价：
-          token 的 KV 不在 cache 中，VAE token 自然无法 attend 到它们
-        
-        Args:
-            vit_mask_flat: (num_vit_tokens,) bool tensor, True=masked（不写入 KV cache）
-            其他参数与 forward_cache_update_vit 相同
-        """
-        if vit_mask_flat is None:
-            # 无 mask，退回到原始方法
-            return self.forward_cache_update_vit(
-                past_key_values=past_key_values,
-                packed_text_ids=packed_text_ids,
-                packed_text_indexes=packed_text_indexes,
-                packed_vit_tokens=packed_vit_tokens,
-                packed_vit_token_indexes=packed_vit_token_indexes,
-                packed_vit_position_ids=packed_vit_position_ids,
-                vit_token_seqlens=vit_token_seqlens,
-                packed_position_ids=packed_position_ids,
-                packed_seqlens=packed_seqlens,
-                packed_indexes=packed_indexes,
-                packed_key_value_indexes=packed_key_value_indexes,
-                key_values_lens=key_values_lens,
-            )
-
-        # Step 1: VIT encoder 处理完整图片（VIT 内部 self-attention 需要完整上下文）
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-
-        cu_seqlens = torch.nn.functional.pad(torch.cumsum(vit_token_seqlens, dim=0), (1, 0))
-        cu_seqlens = cu_seqlens.to(torch.int32)
-        max_seqlen = torch.max(vit_token_seqlens).item()
-        packed_vit_token_embed = self.vit_model(
-            packed_pixel_values=packed_vit_tokens,
-            packed_flattened_position_ids=packed_vit_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        packed_vit_token_embed = self.connector(packed_vit_token_embed)
-        pos_emb = self.vit_pos_embed(packed_vit_position_ids)
-        packed_vit_token_embed = packed_vit_token_embed + pos_emb
-
-        # Step 2: 过滤掉被 mask 的 VIT token，只保留 visible 的
-        # vit_mask_flat: True=masked（要移除），False=visible（要保留）
-        visible_mask = ~vit_mask_flat[:packed_vit_token_embed.shape[0]]
-        visible_vit_embed = packed_vit_token_embed[visible_mask]
-        num_visible = visible_vit_embed.shape[0]
-
-        if num_visible == 0:
-            # 所有 VIT token 都被 mask，只注入 start/end_of_image text token
-            # 构建只包含 text token 的 packed_sequence
-            packed_sequence = packed_text_embedding.new_zeros((len(packed_text_ids), self.hidden_size))
-            packed_sequence[:] = packed_text_embedding
-            new_seqlens = torch.tensor([len(packed_text_ids)], dtype=torch.int, device=packed_text_ids.device)
-            new_position_ids = packed_position_ids[:len(packed_text_ids)]
-            new_indexes = packed_indexes[:len(packed_text_ids)]
-        else:
-            # Step 3: 重建 packed_sequence，只包含 text token + visible VIT token
-            # 原始布局: [start_of_image] [vit_token_0 ... vit_token_N-1] [end_of_image]
-            # 新布局:   [start_of_image] [visible_vit_token_0 ... visible_vit_token_K-1] [end_of_image]
-            total_new_len = len(packed_text_ids) + num_visible  # text tokens + visible VIT tokens
-            packed_sequence = packed_text_embedding.new_zeros((total_new_len, self.hidden_size))
-
-            if packed_vit_token_embed.dtype != packed_sequence.dtype:
-                visible_vit_embed = visible_vit_embed.to(packed_sequence.dtype)
-
-            # 放置 text token（start_of_image 在位置 0，end_of_image 在最后）
-            packed_sequence[0] = packed_text_embedding[0]  # start_of_image
-            packed_sequence[1:1 + num_visible] = visible_vit_embed  # visible VIT tokens
-            packed_sequence[1 + num_visible] = packed_text_embedding[1]  # end_of_image
-
-            new_seqlens = torch.tensor([total_new_len], dtype=torch.int, device=packed_text_ids.device)
-
-            # 重建 position_ids（所有 token 共享同一个 rope position）
-            rope_pos = packed_position_ids[0].item()
-            new_position_ids = torch.full((total_new_len,), rope_pos, dtype=torch.long, device=packed_position_ids.device)
-
-            # 重建 indexes（KV cache 中的绝对位置）
-            kv_start = packed_indexes[0].item()  # 第一个 token 的 KV 位置
-            # 原始 packed_key_value_indexes 指向之前的 KV cache
-            # packed_indexes 是 [kv_start, kv_start+1, ..., kv_start+original_len-1]
-            # 新的 packed_indexes 需要重新编号
-            new_indexes = torch.arange(kv_start, kv_start + total_new_len, dtype=torch.long, device=packed_indexes.device)
-
-        extra_inputs = {}
-        if self.use_moe:
-            extra_inputs = {"mode": "und"}
-
-        output = self.language_model.forward_inference(
-            packed_query_sequence=packed_sequence,
-            query_lens=new_seqlens,
-            packed_query_position_ids=new_position_ids,
-            packed_query_indexes=new_indexes,
-            past_key_values=past_key_values,
-            packed_key_value_indexes=packed_key_value_indexes,
-            key_values_lens=key_values_lens,
-            update_past_key_values=True,
-            is_causal=False,
-            **extra_inputs,
-        )
-        past_key_values = output.past_key_values
-
-        return past_key_values, num_visible
 
     def prepare_vae_images(self, curr_kvlens, curr_rope, images, transforms, new_token_ids, timestep=0):
         patchified_vae_latent_shapes, packed_vae_position_ids = list(), list()
@@ -1410,7 +1195,7 @@ class Bagel(PreTrainedModel):
                 "packed_text_indexes": packed_text_indexes
             }
         
-        if getattr(self.language_model.model, 'enable_taylorseer', False):
+        if self.language_model.model.enable_taylorseer:
             self.language_model.model.cache_dic = model_pred_cache_dic
             self.language_model.model.current = model_pred_current
 
@@ -1430,7 +1215,7 @@ class Bagel(PreTrainedModel):
         v_t = v_t[packed_vae_token_indexes]
 
         if cfg_text_scale > 1.0:
-            if getattr(self.language_model.model, 'enable_taylorseer', False):
+            if self.language_model.model.enable_taylorseer:
                 self.language_model.model.cache_dic = model_pred_text_cache_dic
                 self.language_model.model.current = model_pred_text_current
             cfg_text_output = self.language_model.forward_inference(
@@ -1449,7 +1234,7 @@ class Bagel(PreTrainedModel):
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
         if cfg_img_scale > 1.0:
-            if getattr(self.language_model.model, 'enable_taylorseer', False):
+            if self.language_model.model.enable_taylorseer:
                 self.language_model.model.cache_dic = model_pred_img_cache_dic
                 self.language_model.model.current = model_pred_img_current
             cfg_img_output = self.language_model.forward_inference(

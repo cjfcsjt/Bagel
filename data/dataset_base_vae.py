@@ -176,6 +176,8 @@ class DataConfig:
         partial_noise_mask_ratio=None,
         # behind_vae 模式开关
         behind_vae=False,
+        # 禁用 ce-loss 开关
+        no_ce_loss=False,
     ):
         self.grouped_datasets = grouped_datasets
         self.text_cond_dropout_prob = text_cond_dropout_prob
@@ -191,6 +193,8 @@ class DataConfig:
         self.partial_noise_mask_ratio = partial_noise_mask_ratio if partial_noise_mask_ratio is not None else [0.75]
         # behind_vae 模式：VAE token 放在 VIT 后面，只保留 nonref，做 masked denoise
         self.behind_vae = behind_vae
+        # 禁用 ce-loss：纯重建模式，不计算文本交叉熵损失
+        self.no_ce_loss = no_ce_loss
 
 
 class PackedDataset(torch.utils.data.IterableDataset):
@@ -356,7 +360,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
             # behind_vae 模式的额外字段
             behind_vae_masked_vit_indexes = list(),  # 被 mask 的 VIT token 全局索引
             behind_vae_vae_token_ranges   = list(),  # VAE token 在 packed_sequence 中的范围 (start, end)
-            behind_vae_nonref_vit_info    = list(),  # nonref VIT 的 (token_start_idx, num_tokens) 列表
+            behind_vae_nonref_vit_info    = list(),  # nonref VIT 的 (token_start_idx, num_tokens, H_vit, W_vit) 列表
         )
         return sequence_status
 
@@ -571,7 +575,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 shifted_text_ids = [self.bos_token_id] + text_ids
                 sequence_status['packed_text_ids'].extend(shifted_text_ids)
                 sequence_status['packed_text_indexes'].extend(range(curr, curr + len(shifted_text_ids)))
-                if item['loss'] == 1:
+                if item['loss'] == 1 and not self.data_config.no_ce_loss:
                     sequence_status['ce_loss_indexes'].extend(range(curr, curr + len(shifted_text_ids)))
                     sequence_status['ce_loss_weights'].extend(
                         [len2weight(len(shifted_text_ids))] * len(shifted_text_ids)
@@ -584,7 +588,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 # add a <|im_end|> token
                 sequence_status['packed_text_ids'].append(self.eos_token_id)
                 sequence_status['packed_text_indexes'].append(curr)
-                if item['special_token_loss'] == 1: # <|im_end|> may have loss
+                if item['special_token_loss'] == 1 and not self.data_config.no_ce_loss: # <|im_end|> may have loss
                     sequence_status['ce_loss_indexes'].append(curr)
                     sequence_status['ce_loss_weights'].append(1.0)
                     sequence_status['packed_label_ids'].append(item['special_token_label'])
@@ -623,12 +627,15 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 vit_type = item.get('vit_type', None)
                 sequence_status['packed_vit_types'].extend([vit_type] * num_img_tokens)
 
-                # behind_vae 模式：记录 nonref VIT 的 token 起始索引和数量
+                # behind_vae 模式：记录 nonref VIT 的 token 起始索引、数量和图像尺寸
                 if self.data_config.behind_vae and vit_type == 'nonref':
                     # curr 已经移动到 image tokens 之后，所以起始索引是 curr - num_img_tokens
                     vit_token_start = curr - num_img_tokens
+                    # 记录 VIT 图片的实际像素尺寸 (H_vit, W_vit)，用于 map_vae_mask_to_vit
+                    H_vit_img = image_tensor.size(1)
+                    W_vit_img = image_tensor.size(2)
                     sequence_status['behind_vae_nonref_vit_info'].append(
-                        (vit_token_start, num_img_tokens)
+                        (vit_token_start, num_img_tokens, H_vit_img, W_vit_img)
                     )
 
                 h_vit = image_tensor.size(1) // self.data_config.vit_patch_size
@@ -645,7 +652,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 # add a <|endofimage|> token
                 sequence_status['packed_text_ids'].append(self.end_of_image)
                 sequence_status['packed_text_indexes'].append(curr)
-                if item['special_token_loss'] == 1: # <|endofimage|> may have loss
+                if item['special_token_loss'] == 1 and not self.data_config.no_ce_loss: # <|endofimage|> may have loss
                     sequence_status['ce_loss_indexes'].append(curr)
                     sequence_status['ce_loss_weights'].append(1.0)
                     sequence_status['packed_label_ids'].append(item['special_token_label'])
@@ -716,31 +723,27 @@ class PackedDataset(torch.utils.data.IterableDataset):
                     sequence_status['packed_timesteps'].extend(token_timesteps)
 
                     # VAE mask → VIT mask 跨分辨率映射
-                    # 找到对应的 nonref VIT image 的 token 索引
-                    # behind_vae 模式下，vae_cnt-1 对应的 nonref VIT image 索引
-                    # VIT 包含所有帧（ref + nonref），nonref 从 actual_ref_num 开始
-                    # 但我们需要知道 actual_ref_num，从 sequence_plan 中推断
-                    vit_mask = map_vae_mask_to_vit(
-                        spatial_mask, H, W,
-                        self.data_config.vae_image_downsample,
-                        self.data_config.vit_patch_size,
-                    )
-                    vit_mask_flat = vit_mask.flatten()
-                    # 记录被 mask 的 VIT token 的全局索引
-                    # 需要找到对应 nonref VIT image 在 packed_vit_token_indexes 中的位置
-                    # behind_vae_nonref_vit_info 记录了每个 nonref VIT 的 token 起始索引和数量
+                    # 需要使用对应 nonref VIT 图片的实际像素尺寸（而非 VAE 的 H, W），
+                    # 因为 VIT 和 VAE 使用不同的 transform，图像尺寸可能不同。
+                    # behind_vae_nonref_vit_info 记录了每个 nonref VIT 的 (token_start_idx, num_tokens, H_vit, W_vit)
                     if 'behind_vae_nonref_vit_info' in sequence_status:
                         nonref_vit_infos = sequence_status['behind_vae_nonref_vit_info']
-                        if len(nonref_vit_infos) > 0:
-                            # vae_cnt-1 对应第 vae_cnt-1 个 nonref VIT
-                            nonref_idx = vae_cnt - 1
-                            if nonref_idx < len(nonref_vit_infos):
-                                vit_start_idx, vit_num_tokens = nonref_vit_infos[nonref_idx]
-                                for vi, is_masked in enumerate(vit_mask_flat):
-                                    if is_masked and vi < vit_num_tokens:
-                                        sequence_status['behind_vae_masked_vit_indexes'].append(
-                                            vit_start_idx + vi
-                                        )
+                        nonref_idx = vae_cnt - 1
+                        if len(nonref_vit_infos) > 0 and nonref_idx < len(nonref_vit_infos):
+                            vit_start_idx, vit_num_tokens, H_vit_img, W_vit_img = nonref_vit_infos[nonref_idx]
+                            # 使用 VIT 图片的实际像素尺寸计算 VIT mask
+                            vit_mask = map_vae_mask_to_vit(
+                                spatial_mask, H_vit_img, W_vit_img,
+                                self.data_config.vae_image_downsample,
+                                self.data_config.vit_patch_size,
+                            )
+                            vit_mask_flat = vit_mask.flatten()
+                            # 记录被 mask 的 VIT token 的全局索引
+                            for vi, is_masked in enumerate(vit_mask_flat):
+                                if is_masked and vi < vit_num_tokens:
+                                    sequence_status['behind_vae_masked_vit_indexes'].append(
+                                        vit_start_idx + vi
+                                    )
 
                     # 记录 VAE token 范围
                     sequence_status['behind_vae_vae_token_ranges'].append((curr, curr + num_img_tokens))
@@ -800,7 +803,7 @@ class PackedDataset(torch.utils.data.IterableDataset):
                 sequence_status['packed_text_ids'].append(self.end_of_image)
                 sequence_status['packed_text_indexes'].append(curr)
                 # <|endofimage|> may have loss
-                if item['special_token_loss'] == 1:
+                if item['special_token_loss'] == 1 and not self.data_config.no_ce_loss:
                     sequence_status['ce_loss_indexes'].append(curr)
                     sequence_status['ce_loss_weights'].append(1.0)
                     sequence_status['packed_label_ids'].append(item['special_token_label'])

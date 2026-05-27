@@ -6,7 +6,7 @@ import random
 from PIL import Image, ImageFile, PngImagePlugin
 
 from .interleave_t2i_dataset_vae import InterleavedBaseIterableDataset, ParquetStandardIterableDataset
-from ..data_utils import pil_img2rgb
+from ..data_utils import pil_img2rgb, apply_template_qwenvl2
 import os
 
 Image.MAX_IMAGE_PIXELS = 200000000
@@ -19,21 +19,19 @@ PngImagePlugin.MAX_TEXT_CHUNK = MaximumDecompressedSize * MegaByte
 
 class MAEMaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandardIterableDataset):
     """
-    MAE-style masked reconstruction dataset for multi-view images.
+    Partial-noise multi-view consistency dataset.
+    
+    使用 apply_template_qwenvl2 模板构造文本 + VAE 图片序列。
+    所有图片以 video 模式（共享 timestep、帧间双向注意力）添加到序列中。
     
     Data layout in the packed sequence (for one sample):
-        --- Pass 1: ALL images' VIT tokens as condition (no loss) ---
-        [ref_1_vit(ref_vit)] [ref_2_vit(ref_vit)] ... [nonref_1_vit(nonref_vit)] ...
-        --- Pass 2: ALL images' VAE noise tokens in video mode (with loss) ---
-        [ref_1_vae(ref_noise)] [ref_2_vae(ref_noise)] ... [nonref_1_vae(nonref_noise)] ...
-        (all VAE frames share one timestep, bidirectional attention between frames)
+        [text tokens (template)] [ref_1_vae(ref)] [ref_2_vae(ref)] ... [nonref_1_vae(nonref)] ...
+        (all VAE frames in one "full" split, sharing timestep, bidirectional attention)
     
-    - VIT tokens (pass 1): ref_vit type → unmasked; nonref_vit type → masked in forward
-      All VIT tokens are in "full" attention splits, visible to all subsequent tokens.
-    - VAE noise tokens (pass 2): added via _add_video (video mode)
-      → all frames in one "full" split with frame_delta, sharing one timestep
-      → bidirectional attention between all VAE frames
-      → can attend to all preceding VIT condition tokens
+    - ref 图片: vae_type='ref', loss=0（不参与去噪 loss，保持 clean）
+    - nonref 图片: vae_type='nonref', loss=1（被 mask 的位置加噪去噪，计算 MSE loss）
+    - 不使用 VIT token
+    - mask 生成在 pack_sequence 中完成（数据打包层）
     """
 
     def __init__(self, ref_num=2, max_frames=8, **kwargs):
@@ -148,65 +146,72 @@ class MAEMaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStand
 
         # 4. Split into ref / non-ref (at least 1 non-ref)
         ref_num = min(self.ref_num, sampled_num - 1)
-        ref_images = images[:ref_num]
-        nonref_images = images[ref_num:]
+
+        # 5. 使用 apply_template_qwenvl2 构造模板化文本 + VAE 图片序列
+        question = 'Reconstruct the scene' + '<vae_image>' * len(images)
+        answer = ''
+        split_list = apply_template_qwenvl2(
+            question_with_image_tokens=question, answer=answer
+        )
 
         data = self._init_data()
 
-        # 5. Pass 1: 按顺序添加所有图片的 VIT token 作为 condition（no loss）
-        #    - ref 图片: vit_type="ref_vit"，forward 中不做 masking
-        #    - nonref 图片: vit_type="nonref_vit"，forward 中对 masked 位置替换为 vit_mask_placeholder
-        #    每个 VIT 是独立的 "full" split，可以被后续所有 token 看到。
-        for i, img in enumerate(images):
-            if i < ref_num:
-                data = self._add_image(
-                    data, img,
-                    need_loss=False,
-                    need_vae=False,
-                    need_vit=True,
-                    vit_type="ref_vit",
-                    enable_cfg=False,
-                )
-            else:
-                data = self._add_image(
-                    data, img,
-                    need_loss=False,
-                    need_vae=False,
-                    need_vit=True,
-                    vit_type="nonref_vit",
-                    enable_cfg=False,
-                )
+        # 6. 遍历 split_list，构造 sequence_plan
+        #    - text 类型：tokenize 并加入 text_ids_list + sequence_plan
+        #    - vae 类型：以 video 模式添加 VAE 图片（ref/nonref 区分）
+        vae_counter = 0  # 追踪当前是第几张 VAE 图片
+        total_vae_count = len(images)
+        frame_indexes = list(range(total_vae_count))
 
-        # 6. Pass 2: 用 video 模式添加所有图片的 VAE noise token（with loss）
-        #    所有帧合并为一个 "full" split，共享同一个 timestep，帧间双向注意力。
-        #    这些 noised VAE token 可以看到前面所有的 VIT condition token。
-        #    ref 图片: vae_type="ref_noise"
-        #    nonref 图片: vae_type="nonref_noise"
-        #    注意：_add_video 中所有帧共用同一个 vae_type，
-        #    所以需要分别调用 ref 和 nonref，但仍然在同一个 video split 中。
-        #    这里我们手动构建 video split 来支持不同的 vae_type。
-        frame_indexes = list(range(len(images)))
-        for i, (img, frame_idx) in enumerate(zip(images, frame_indexes)):
-            vae_type = "ref_noise" if i < ref_num else "nonref_noise"
-            current_sequence_plan = {
-                'type': 'vae_image',
-                'enable_cfg': 0,
-                'loss': 1,
-                'special_token_loss': 0,
-                'special_token_label': None,
-                'vae_type': vae_type,
-                'split_start': i == 0,
-                'split_end': i == len(images) - 1,
-            }
-            if i < len(frame_indexes) - 1:
-                current_sequence_plan['frame_delta'] = frame_indexes[i + 1] - frame_idx
-            data['sequence_plan'].append(current_sequence_plan)
-            image_tensor = self.transform(img)
-            height, width = image_tensor.shape[1:]
-            data['image_tensor_list'].append(image_tensor)
-            data['num_tokens'] += width * height // self.transform.stride ** 2
+        for item in split_list:
+            if item['type'] == 'text':
+                text_data = item['value']
+                text_ids = self.tokenizer.encode(text_data)
+                if len(text_ids) > 0:
+                    data['text_ids_list'].append(text_ids)
+                    data['num_tokens'] += len(text_ids)
+                    current_plan = {
+                        'type': 'text',
+                        'enable_cfg': 0,
+                        'loss': int(item['loss']),
+                        'special_token_loss': 0,
+                        'special_token_label': None,
+                    }
+                    data['sequence_plan'].append(current_plan)
 
-        # 7. mask_ratio and mask_mode are now model attributes (BagelConfig),
-        #    no longer passed from dataset.
+            elif item['type'] == 'vae':
+                # 当前图片
+                img = images[vae_counter]
+                frame_idx = frame_indexes[vae_counter]
+
+                # 区分 ref / nonref
+                if vae_counter < ref_num:
+                    vae_type = 'ref'
+                    loss = 0
+                else:
+                    vae_type = 'nonref'
+                    loss = 1
+
+                # video 模式：split_start / split_end / frame_delta
+                current_sequence_plan = {
+                    'type': 'vae_image',
+                    'enable_cfg': 0,
+                    'loss': loss,
+                    'special_token_loss': 0,
+                    'special_token_label': None,
+                    'vae_type': vae_type,
+                    'split_start': vae_counter == 0,
+                    'split_end': vae_counter == total_vae_count - 1,
+                }
+                if vae_counter < total_vae_count - 1:
+                    current_sequence_plan['frame_delta'] = frame_indexes[vae_counter + 1] - frame_idx
+
+                data['sequence_plan'].append(current_sequence_plan)
+                image_tensor = self.transform(img)
+                height, width = image_tensor.shape[1:]
+                data['image_tensor_list'].append(image_tensor)
+                data['num_tokens'] += width * height // self.transform.stride ** 2
+
+                vae_counter += 1
 
         return data

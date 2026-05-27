@@ -22,7 +22,7 @@ export DISABLE_ADDMM_CUDA_LT=1
 export TORCH_CUDNN_USE_HEURISTIC_MODE_B=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES}
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 # NCCL settings
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG="WARN"
@@ -31,19 +31,19 @@ export NCCL_BLOCKING_WAIT=1
 # export NCCL_NET_PLUGIN=none
 export NCCL_IB_HCA="mlx5_0"
 export NCCL_P2P_LEVEL="NVL"
-RUNID=116
+RUNID=171
 # replace the variables with your own
 torchrun \
   --nnodes=1 \
   --node_rank=0 \
-  --nproc_per_node=8 \
+  --nproc_per_node=4 \
   --master_addr=localhost \
   --master_port=12345 \
   train/pretrain_unified_navit_vae.py \
   --dataset_config_file ./data/configs/joint_train.yaml \
   --layer_module Qwen2MoTDecoderLayer \
-  --model_path /tmp/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
-  --resume-from /tmp/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
+  --model_path /root/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
+  --resume-from /root/.cache/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b/ \
   --max_latent_size 64 \
   --finetune_from_hf True \
   --auto_resume True \
@@ -51,17 +51,22 @@ torchrun \
   --finetune-from-ema True \
   --visual_gen True \
   --visual_und True \
-  --use_masking True \
+  --freeze_und False \
+  --use_masking False \
+  --use_mae_masking False \
+  --use_partial_noise True \
+  --behind_vae False \
+  --no_ce_loss True \
   --mask_mode "random,rectangle,ellipse" \
   --mask_ratio "0.9,0.75,0.75" \
-  --max_num_tokens 52000 \
-  --expected_num_tokens 50000 \
-  --max_num_tokens_per_sample 45000 \
-  --num_shard 8 \
+  --max_num_tokens 64000 \
+  --expected_num_tokens 63000 \
+  --max_num_tokens_per_sample 60000 \
+  --num_shard 4 \
   --cpu_offload False \
   --use_flex True \
   --results_dir ./results \
-  --checkpoint_dir $HOME/code/ckpt/joint_vae_geo_then_und_mindcube_raw_qa_${RUNID} \
+  --checkpoint_dir $HOME/code/ckpt/joint_vae_geo_videollm3d_partial_masking_denoise_vae_prefix_${RUNID} \
   --save_every 200 \
   --log_every 1 \
   --lr 2e-5 \

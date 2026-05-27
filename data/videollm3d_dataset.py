@@ -423,7 +423,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
 
     def _reshuffle_data_paths(self):
         """在 while True 循环的每轮 repeat 开头重新 shuffle。"""
-        self._epoch_counter += 1
+        # 注意：epoch_counter 的递增统一在 __iter__ 末尾进行，这里不再重复递增
         new_seed = self.shuffle_seed + self._epoch_counter
 
         if self.task_grouped_shuffle:
@@ -479,15 +479,18 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
             f"resuming data at row#{row_start_id}"
         )
 
+        _reshuffle_log_interval = max(1, 10000000)  # 每 100 个 epoch 打印一次 re-shuffle 日志
+
         while True:
             # ── re-shuffle：每轮 repeat 重新打乱（第一轮除外） ──
             if row_start_id == 0 and self._epoch_counter > 0:
                 self._reshuffle_data_paths()
                 data_paths_per_worker, _ = self.get_data_paths_per_worker()
-                print(
-                    f"[VideoLLM3D] rank-{self.local_rank} worker-{worker_id}: "
-                    f"re-shuffled (epoch={self._epoch_counter})"
-                )
+                if self._epoch_counter % _reshuffle_log_interval == 0:
+                    print(
+                        f"[VideoLLM3D] rank-{self.local_rank} worker-{worker_id}: "
+                        f"re-shuffled (epoch={self._epoch_counter})"
+                    )
 
             data_paths_per_worker_ = data_paths_per_worker[row_start_id:]
             for row_idx, (data, image_dir) in enumerate(
@@ -705,7 +708,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                                 # behind_vae 模式：VAE 只有 nonref，从 raw_images 中取 nonref 帧
                                 raw_image_idx = actual_ref_num + vae_counter
                                 raw_image = raw_images[raw_image_idx]
-                                image_tensor = vae_transform(raw_image, img_num=total_vae_count)
+                                image_tensor = vae_transform(raw_image, img_num=1)
                                 image_tensor_list.append(image_tensor)
                                 height, width = image_tensor.shape[1:]
                                 num_tokens += width * height // vae_stride ** 2
@@ -731,7 +734,7 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
                             else:
                                 # 原有模式：包含 ref 和 nonref
                                 raw_image = raw_images[vae_counter]
-                                image_tensor = vae_transform(raw_image, img_num=total_vae_count)
+                                image_tensor = vae_transform(raw_image, img_num=1)
                                 image_tensor_list.append(image_tensor)
                                 height, width = image_tensor.shape[1:]
                                 num_tokens += width * height // vae_stride ** 2
@@ -804,11 +807,12 @@ class VideoLLM3DIterableDataset(DistributedIterableDataset):
             # 一轮遍历完毕，重置 row_start_id，进入下一轮 repeat
             row_start_id = 0
             self._epoch_counter += 1
-            print(
-                f"{self.dataset_name} repeat in "
-                f"rank-{self.local_rank} worker-{worker_id} "
-                f"(epoch={self._epoch_counter})"
-            )
+            if self._epoch_counter % _reshuffle_log_interval == 0:
+                print(
+                    f"{self.dataset_name} repeat in "
+                    f"rank-{self.local_rank} worker-{worker_id} "
+                    f"(epoch={self._epoch_counter})"
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════

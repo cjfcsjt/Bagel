@@ -219,6 +219,10 @@ class TrainingArguments:
         default=True,
         metadata={"help": "Train image understanding branch."}
     )
+    no_ce_loss: bool = field(
+        default=False,
+        metadata={"help": "When True, disable all text cross-entropy loss (pure reconstruction mode)."}
+    )
 
     # --- bookkeeping & logging ---
     results_dir: str = field(
@@ -458,9 +462,9 @@ def main():
             mode="offline" if training_args.wandb_offline else "online",
             settings=wandb.Settings(init_timeout=120)
         )
-        wandb.config.update(training_args)
-        wandb.config.update(model_args)
-        wandb.config.update(data_args)
+        wandb.config.update(training_args, allow_val_change=True)
+        wandb.config.update(model_args, allow_val_change=True)
+        wandb.config.update(data_args, allow_val_change=True)
         if training_args.peak_device_tflops > 0:
             logger.info(f"Using peak_device_tflops={training_args.peak_device_tflops:.2f} TFLOPs (per GPU).")
         else:
@@ -664,6 +668,8 @@ def main():
         dataset_config.partial_noise_mask_ratio = [float(r) for r in training_args.mask_ratio.split(',')]
     # behind_vae 配置注入
     dataset_config.behind_vae = training_args.behind_vae
+    # no_ce_loss 配置注入
+    dataset_config.no_ce_loss = training_args.no_ce_loss
     train_dataset = PackedDataset(
         dataset_config,
         tokenizer=tokenizer,

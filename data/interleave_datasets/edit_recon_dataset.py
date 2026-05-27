@@ -6,7 +6,7 @@ import random
 from PIL import Image, ImageFile, PngImagePlugin
 
 from .interleave_t2i_dataset_vae import InterleavedBaseIterableDataset, ParquetStandardIterableDataset
-from ..data_utils import pil_img2rgb
+from ..data_utils import pil_img2rgb, apply_template_qwenvl2
 import os
 
 Image.MAX_IMAGE_PIXELS = 200000000
@@ -38,10 +38,11 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
         attends to ALL preceding clean condition tokens for reconstruction
     """
 
-    def __init__(self, ref_num=2, max_frames=8, **kwargs):
+    def __init__(self, ref_num=2, max_frames=8, behind_vae=False, **kwargs):
         super().__init__(**kwargs)
         self.ref_num = ref_num
         self.max_frames = max_frames
+        self.behind_vae = behind_vae
 
     def _sample_indices(self, num_imgs, max_distance=10):
         """
@@ -150,20 +151,30 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
 
         # 4. Split into ref / non-ref (at least 1 non-ref)
         ref_num = min(self.ref_num, sampled_num - 1)
-        ref_images = images[:ref_num]
-        nonref_images = images[ref_num:]
 
+        # 5. 根据模式分支
+        if self.behind_vae:
+            return self._parse_row_behind_vae(images, ref_num)
+        else:
+            return self._parse_row_two_pass(images, ref_num)
+
+    def _parse_row_two_pass(self, images, ref_num):
+        """
+        原始的两遍模式（two-pass）数据构造。
+
+        Data layout:
+            --- Pass 1: ALL images as clean condition (no loss) ---
+            [ref_1_vae_clean][ref_1_vit] ... [ref_K_vae_clean][ref_K_vit]
+            [nonref_1_vae_clean] ... [nonref_M_vae_clean]
+            --- Pass 2: nonref images as noise VAE (with loss) ---
+            [nonref_1_vae_noise] ... [nonref_M_vae_noise]
+        """
+        nonref_images = images[ref_num:]
         data = self._init_data()
 
-        # 5. First pass: add ALL images (ref + nonref) as clean condition (no loss)
-        #    - ref images: fully visible clean VAE + VIT condition
-        #    - nonref images: clean VAE only (no VIT!) — masked positions in clean VAE
-        #      will be replaced with learnable mask_placeholder in forward.
-        #      VIT is NOT added for nonref images to prevent information leakage
-        #      (VIT tokens are unmasked and would reveal the full image).
+        # Pass 1: add ALL images (ref + nonref) as clean condition (no loss)
         for i, img in enumerate(images):
             if i < ref_num:
-                # ref image: full clean VAE + VIT condition
                 data = self._add_image(
                     data, img,
                     need_loss=False,
@@ -173,7 +184,6 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
                     enable_cfg=False,
                 )
             else:
-                # nonref image: clean VAE only (no VIT to avoid leaking masked regions)
                 data = self._add_image(
                     data, img,
                     need_loss=False,
@@ -183,23 +193,111 @@ class MaskedReconIterableDataset(InterleavedBaseIterableDataset, ParquetStandard
                     enable_cfg=False,
                 )
 
-        # 6. Second pass: add nonref images as noise VAE tokens (with loss)
-        #    need_vae=False, need_vit=False because clean condition copies
-        #    were already added in the first pass above.
-        #    These noise tokens attend to all preceding tokens (ref clean vae,
-        #    ref vit, nonref masked clean vae) via attention for reconstruction.
-        #    Note: nonref images have NO VIT in either pass to prevent leakage.
+        # Pass 2: add nonref images as noise VAE tokens (with loss)
         for img in nonref_images:
             data = self._add_image(
                 data, img,
-                need_loss=True,   # mse loss on masked patches
-                need_vae=False,   # clean vae condition already added in first pass
-                need_vit=False,   # vit condition already added in first pass
+                need_loss=True,
+                need_vae=False,
+                need_vit=False,
                 vae_type="nonref_noise",
                 enable_cfg=False,
             )
 
-        # 7. mask_ratio and mask_mode are now model attributes (BagelConfig),
-        #    no longer passed from dataset.
+        return data
+
+    def _parse_row_behind_vae(self, images, ref_num):
+        """
+        behind_vae 模式的数据构造。
+
+        Data layout:
+            [text: system + user prompt]
+              [VIT: ref_1] [VIT: ref_2] ... [VIT: ref_K]
+              [VIT: nonref_1] [VIT: nonref_2] ... [VIT: nonref_M]
+              [VAE: nonref_1 (masked denoise)] ... [VAE: nonref_M (masked denoise)]
+            [text: assistant]
+
+        - 所有帧（ref + nonref）都有 VIT token
+        - 只有 nonref 帧有 VAE token（放在 VIT 之后），做 masked denoise
+        - ref VIT: vit_type='ref'，完全可见
+        - nonref VIT: vit_type='nonref'，被 mask 的 VIT token 对 VAE 不可见
+        - nonref VAE: vae_type='nonref'，loss=1，video 模式
+        """
+        total_count = len(images)
+        nonref_count = total_count - ref_num
+
+        # 构造 question: VIT tokens for all + VAE tokens for nonref only
+        question = 'Reconstruct the scene' + '<vit_image>' * total_count + '<vae_image>' * nonref_count
+        answer = ''
+        split_list = apply_template_qwenvl2(
+            question_with_image_tokens=question, answer=answer
+        )
+
+        data = self._init_data()
+
+        vit_counter = 0   # 追踪当前处理到第几个 VIT image
+        vae_counter = 0   # 追踪当前处理到第几个 VAE image
+        frame_indexes = list(range(nonref_count))
+
+        for item in split_list:
+            if item['type'] == 'text':
+                text_data = item['value']
+                text_ids = self.tokenizer.encode(text_data)
+                if len(text_ids) > 0:
+                    data['text_ids_list'].append(text_ids)
+                    data['num_tokens'] += len(text_ids)
+                    data['sequence_plan'].append({
+                        'type': 'text',
+                        'enable_cfg': 0,
+                        'loss': int(item['loss']),
+                        'special_token_loss': 0,
+                        'special_token_label': None,
+                    })
+
+            elif item['type'] == 'vit':
+                # VIT token: ref 或 nonref
+                img = images[vit_counter]
+                vit_type = 'ref' if vit_counter < ref_num else 'nonref'
+
+                data['sequence_plan'].append({
+                    'type': 'vit_image',
+                    'enable_cfg': 0,
+                    'loss': 0,
+                    'special_token_loss': 0,
+                    'special_token_label': None,
+                    'vit_type': vit_type,
+                })
+                vit_image_tensor = self.vit_transform(img)
+                height, width = vit_image_tensor.shape[1:]
+                data['image_tensor_list'].append(vit_image_tensor)
+                data['num_tokens'] += width * height // self.vit_transform.stride ** 2
+
+                vit_counter += 1
+
+            elif item['type'] == 'vae':
+                # VAE token: 只有 nonref 帧，video 模式
+                nonref_idx = vae_counter
+                img = images[ref_num + nonref_idx]  # nonref 图片从 images[ref_num] 开始
+
+                current_sequence_plan = {
+                    'type': 'vae_image',
+                    'enable_cfg': 0,
+                    'loss': 1,
+                    'special_token_loss': 0,
+                    'special_token_label': None,
+                    'vae_type': 'nonref',
+                    'split_start': vae_counter == 0,
+                    'split_end': vae_counter == nonref_count - 1,
+                }
+                if vae_counter < nonref_count - 1:
+                    current_sequence_plan['frame_delta'] = frame_indexes[vae_counter + 1] - frame_indexes[vae_counter]
+
+                data['sequence_plan'].append(current_sequence_plan)
+                image_tensor = self.transform(img)
+                height, width = image_tensor.shape[1:]
+                data['image_tensor_list'].append(image_tensor)
+                data['num_tokens'] += width * height // self.transform.stride ** 2
+
+                vae_counter += 1
 
         return data

@@ -68,7 +68,7 @@ class Dinov2WithRegistersSelfAttention2(Dinov2WithRegistersSelfAttention):
         query_states = query_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
         key_states = key_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
         value_states = value_states.view(total_q_len, self.num_attention_heads, self.attention_head_size)
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             context_layer = flash_attn_varlen_func(
                 query_states,
                 key_states,

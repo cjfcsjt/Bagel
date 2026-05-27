@@ -70,7 +70,7 @@
 #   - 4    # ← 对应 mindcube_raw_qa, (parquet 1, 10k)，取 200 个 parquet 文件
 #   weight: 0.5
 
-# mae_recon:
+# recon:
 #   dataset_names:
 #   - re10k
 #   # dino_image_transform_args:
@@ -168,9 +168,9 @@ videollm3d:
   # - 30000   # scanrefer
   # - 30000   # multi3drefer
   # ── VideoProcessor 扁平参数 ──
-  video_folder: /mnt/group/jingfanchen/data/sft/Video-3D-LLM_data/
-  annotation_dir: /mnt/group/jingfanchen/data/sft/Video-3D-LLM_data/embodiedscan/
-  metadata_dir: /mnt/group/jingfanchen/data/sft/Video-3D-LLM_data/metadata/
+  video_folder: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/
+  annotation_dir: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/embodiedscan/
+  metadata_dir: /apdcephfs_303747097/share_303747097/jingfanchen/data/sft/Video-3D-LLM_data/metadata/
   voxel_size: 0.1
   min_xyz_range: [-15, -15, -5]
   max_xyz_range: [15, 15, 5]
